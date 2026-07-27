@@ -121,6 +121,10 @@ func chaincodeInvokeOrQuery(cmd *cobra.Command, invoke bool, cf *ChaincodeCmdFac
 			return errors.Errorf("endorsement failure during invoke. response: %v", proposalResp.Response)
 		}
 		logger.Infof("Chaincode invoke successful. result: %v", ca.Response)
+		if proposalResp.Response != nil &&
+			strings.HasPrefix(proposalResp.Response.Message, protoutil.GrandActiveSyncResultMessagePrefix) {
+			fmt.Println(string(proposalResp.Response.Payload))
+		}
 	} else {
 		if proposalResp == nil {
 			return errors.New("error during query: received nil proposal response")
@@ -543,6 +547,14 @@ func ChaincodeInvokeOrQuery(
 			if err != nil {
 				return proposalResp, errors.WithMessage(err, "could not assemble transaction")
 			}
+			envelopeBytes, err := proto.Marshal(env)
+			if err != nil {
+				return proposalResp, errors.WithMessage(err, "could not encode assembled transaction")
+			}
+			grandBundle, err := protoutil.GetGrandRelaxedEvidenceBundleFromEnvelope(envelopeBytes)
+			if err != nil {
+				return proposalResp, errors.WithMessage(err, "could not decode assembled GraND transaction")
+			}
 			var dg *DeliverGroup
 			var ctx context.Context
 			if waitForEvent {
@@ -576,6 +588,11 @@ func ChaincodeInvokeOrQuery(
 				if err != nil {
 					return nil, err
 				}
+			}
+			if grandBundle != nil && grandBundle.ActiveSync != nil {
+				proposalResp = proto.Clone(proposalResp).(*pb.ProposalResponse)
+				proposalResp.Response.Message = protoutil.GrandActiveSyncResultMessagePrefix
+				proposalResp.Response.Payload = append([]byte(nil), grandBundle.ActiveSync.Value...)
 			}
 		}
 	}
