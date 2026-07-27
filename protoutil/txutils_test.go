@@ -553,9 +553,12 @@ func TestGrandRelaxedEvidenceIsCarriedButExcludedFromProposalHash(t *testing.T) 
 	require.Equal(t, [][]byte{[]byte("evidence-1"), []byte("evidence-2")}, bundle)
 }
 
-func TestComputeGrandActiveSyncMedian(t *testing.T) {
-	prices := []int64{105, 101, 103}
-	mspIDs := []string{"Org3MSP", "Org1MSP", "Org2MSP"}
+func TestComputeGrandActiveSyncMedianFromThreeOfFourPeers(t *testing.T) {
+	// Org3 is the fourth, unavailable peer. Org4 contributes an extreme
+	// Byzantine observation, which cannot move the three-value median outside
+	// the two collected honest observations.
+	prices := []int64{1_000_000, 102, 104}
+	mspIDs := []string{"Org4MSP", "Org1MSP", "Org2MSP"}
 	evidence := make([][]byte, 0, len(prices))
 	for index, price := range prices {
 		value := []byte(fmt.Sprintf(`{"symbol":"BTC-USD","sourceId":"source-%d","price":%d}`, index, price))
@@ -583,11 +586,16 @@ func TestComputeGrandActiveSyncMedian(t *testing.T) {
 	require.Equal(t, "grandmarket", result.Namespace)
 	require.Equal(t, "quote:BTC-USD", result.Key)
 	require.Equal(t, protoutil.GrandMedianJSONPriceAlgorithm, result.Algorithm)
-	require.Equal(t, []string{"Org1MSP", "Org2MSP", "Org3MSP"}, result.MSPIDs)
-	require.JSONEq(t, `{"symbol":"BTC-USD","sourceId":"source-2","price":103}`, string(result.Value))
+	require.Equal(t, []string{"Org1MSP", "Org2MSP", "Org4MSP"}, result.MSPIDs)
+	require.JSONEq(t, `{"symbol":"BTC-USD","sourceId":"source-2","price":104}`, string(result.Value))
 	hash := sha256.Sum256(result.Value)
 	require.Equal(t, hash[:], result.ValueHash)
 	require.NoError(t, protoutil.ValidateGrandActiveSyncResult(evidence, result))
+	require.Equal(t, 3, protoutil.GrandActiveSyncObservationQuorum)
+	_, err = protoutil.ComputeGrandActiveSyncResult(evidence[:2])
+	require.ErrorContains(t, err, "requires exactly 3 observations")
+	_, err = protoutil.ComputeGrandActiveSyncResult(append(evidence, evidence[0]))
+	require.ErrorContains(t, err, "requires exactly 3 observations")
 
 	tampered := *result
 	tampered.Value = []byte(`{"symbol":"BTC-USD","sourceId":"source-3","price":105}`)

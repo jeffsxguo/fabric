@@ -38,6 +38,7 @@ const (
 	GrandActiveSyncPurpose             = "active-sync"
 	GrandLocalEndorsementDomain        = "GRAND_LOCAL_STATE_ENDORSEMENT_V1"
 	GrandMedianJSONPriceAlgorithm      = "median-json-price-v1"
+	GrandActiveSyncObservationQuorum   = 3
 	grandRelaxedEvidenceBundleVersion  = 1
 )
 
@@ -633,8 +634,12 @@ func grandEvidenceIncludesActiveSync(evidence [][]byte) bool {
 // exactly three distinct peer MSP observations. Signature verification remains
 // a V-stage responsibility because protoutil has no channel MSP manager.
 func ComputeGrandActiveSyncResult(evidence [][]byte) (*GrandActiveSyncResult, error) {
-	if len(evidence) != 3 {
-		return nil, errors.Errorf("median-json-price-v1 requires exactly 3 observations, got %d", len(evidence))
+	if len(evidence) != GrandActiveSyncObservationQuorum {
+		return nil, errors.Errorf(
+			"median-json-price-v1 requires exactly %d observations, got %d",
+			GrandActiveSyncObservationQuorum,
+			len(evidence),
+		)
 	}
 
 	type observation struct {
