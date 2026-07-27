@@ -10,11 +10,24 @@ import (
 	"bytes"
 	"crypto/sha256"
 	b64 "encoding/base64"
+	"encoding/json"
+	"sort"
+	"strings"
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	"github.com/pkg/errors"
 	"google.golang.org/protobuf/proto"
+)
+
+const (
+	// GrandRelaxedEvidenceMessagePrefix marks an individually signed, peer-local
+	// relaxed-state endorsement carried alongside a canonical proposal response.
+	GrandRelaxedEvidenceMessagePrefix = "GRAND_LOCAL_STATE_ENDORSEMENT_V1:"
+	// GrandRelaxedEvidenceTransientKey is retained in the ordered transaction as
+	// an opaque evidence bundle. Unlike application transient data, validators
+	// intentionally preserve and inspect this reserved entry.
+	GrandRelaxedEvidenceTransientKey = "GRAND_RELAXED_EVIDENCE_V1"
 )
 
 // GetPayloads gets the underlying payload objects in a TransactionAction
@@ -216,7 +229,7 @@ func CreateSignedTx(
 	cea := &peer.ChaincodeEndorsedAction{ProposalResponsePayload: resps[0].Payload, Endorsements: endorsements}
 
 	// obtain the bytes of the proposal payload that will go to the transaction
-	propPayloadBytes, err := GetBytesProposalPayloadForTx(pPayl)
+	propPayloadBytes, err := proposalPayloadForTxWithGrandEvidence(pPayl, resps)
 	if err != nil {
 		return nil, err
 	}
@@ -463,6 +476,31 @@ func GetProposalHash2(header *common.Header, ccPropPayl []byte) ([]byte, error) 
 		return nil, errors.New("nil arguments")
 	}
 
+	// A GraND evidence bundle is added by the client after collecting the
+	// individually signed local results. It is covered by the transaction
+	// creator's envelope signature, but is excluded from the common proposal
+	// hash so canonical endorsers can sign the same strong/normal projection.
+	cpp, unmarshalErr := UnmarshalChaincodeProposalPayload(ccPropPayl)
+	if unmarshalErr != nil {
+		cpp = nil
+	} else {
+		_, hasGrandEvidence := cpp.TransientMap[GrandRelaxedEvidenceTransientKey]
+		if !hasGrandEvidence {
+			cpp = nil
+		}
+	}
+	if cpp != nil {
+		delete(cpp.TransientMap, GrandRelaxedEvidenceTransientKey)
+		if len(cpp.TransientMap) == 0 {
+			cpp.TransientMap = nil
+		}
+		var err error
+		ccPropPayl, err = GetBytesChaincodeProposalPayload(cpp)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	hash := sha256.New()
 	// hash the serialized Channel Header object
 	hash.Write(header.ChannelHeader)
@@ -471,6 +509,79 @@ func GetProposalHash2(header *common.Header, ccPropPayl []byte) ([]byte, error) 
 	// hash the bytes of the chaincode proposal payload that we are given
 	hash.Write(ccPropPayl)
 	return hash.Sum(nil), nil
+}
+
+func proposalPayloadForTxWithGrandEvidence(
+	payload *peer.ChaincodeProposalPayload,
+	responses []*peer.ProposalResponse,
+) ([]byte, error) {
+	evidence := make([][]byte, 0, len(responses))
+	for _, response := range responses {
+		if response == nil || response.Response == nil ||
+			!strings.HasPrefix(response.Response.Message, GrandRelaxedEvidenceMessagePrefix) {
+			continue
+		}
+		encoded := strings.TrimPrefix(response.Response.Message, GrandRelaxedEvidenceMessagePrefix)
+		decoded, err := b64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, errors.Wrap(err, "decode GraND local-state endorsement")
+		}
+		evidence = append(evidence, decoded)
+	}
+	if len(evidence) == 0 {
+		return GetBytesProposalPayloadForTx(payload)
+	}
+
+	sort.Slice(evidence, func(i, j int) bool {
+		return bytes.Compare(evidence[i], evidence[j]) < 0
+	})
+	bundle, err := json.Marshal(evidence)
+	if err != nil {
+		return nil, errors.Wrap(err, "encode GraND relaxed evidence bundle")
+	}
+	return GetBytesChaincodeProposalPayload(&peer.ChaincodeProposalPayload{
+		Input: payload.Input,
+		TransientMap: map[string][]byte{
+			GrandRelaxedEvidenceTransientKey: bundle,
+		},
+	})
+}
+
+// GetGrandRelaxedEvidenceFromEnvelope extracts individually signed relaxed
+// evidence entries from an ordered endorser transaction.
+func GetGrandRelaxedEvidenceFromEnvelope(txEnvelopeBytes []byte) ([][]byte, error) {
+	envelope, err := GetEnvelopeFromBlock(txEnvelopeBytes)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := UnmarshalPayload(envelope.Payload)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := UnmarshalTransaction(payload.Data)
+	if err != nil {
+		return nil, err
+	}
+	if len(tx.Actions) != 1 {
+		return nil, errors.Errorf("expected one transaction action, got %d", len(tx.Actions))
+	}
+	action, err := UnmarshalChaincodeActionPayload(tx.Actions[0].Payload)
+	if err != nil {
+		return nil, err
+	}
+	proposalPayload, err := UnmarshalChaincodeProposalPayload(action.ChaincodeProposalPayload)
+	if err != nil {
+		return nil, err
+	}
+	bundle := proposalPayload.TransientMap[GrandRelaxedEvidenceTransientKey]
+	if len(bundle) == 0 {
+		return nil, nil
+	}
+	var evidence [][]byte
+	if err := json.Unmarshal(bundle, &evidence); err != nil {
+		return nil, errors.Wrap(err, "decode GraND relaxed evidence bundle")
+	}
+	return evidence, nil
 }
 
 // GetProposalHash1 gets the proposal hash bytes after sanitizing the

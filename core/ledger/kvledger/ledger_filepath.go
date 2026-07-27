@@ -35,6 +35,13 @@ func StateDBPath(rootFSPath string) string {
 	return filepath.Join(rootFSPath, "stateLeveldb")
 }
 
+// RelaxedStateDBPath returns the peer-local GraND relaxed-state root. Unlike
+// StateDBPath, values below this path are intentionally allowed to diverge
+// between peers and are not reconstructed from the canonical block store.
+func RelaxedStateDBPath(rootFSPath string) string {
+	return filepath.Join(rootFSPath, "grandRelaxedState")
+}
+
 // HistoryDBPath returns the absolute path of history DB
 func HistoryDBPath(rootFSPath string) string {
 	return filepath.Join(rootFSPath, "historyLeveldb")

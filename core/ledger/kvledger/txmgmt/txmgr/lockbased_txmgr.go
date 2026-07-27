@@ -8,14 +8,17 @@ package txmgr
 
 import (
 	"bytes"
+	"path/filepath"
 	"sync"
 
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	"github.com/hyperledger/fabric-protos-go-apiv2/ledger/rwset"
 	"github.com/hyperledger/fabric-protos-go-apiv2/ledger/rwset/kvrwset"
+	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	"github.com/hyperledger/fabric/common/ledger/snapshot"
 	"github.com/hyperledger/fabric/core/ledger"
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	"github.com/hyperledger/fabric/core/ledger/internal/version"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/bookkeeping"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/privacyenabledstate"
@@ -24,7 +27,11 @@ import (
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/validation"
 	"github.com/hyperledger/fabric/core/ledger/pvtdatapolicy"
+	"github.com/hyperledger/fabric/core/ledger/relaxedstate"
 	"github.com/hyperledger/fabric/core/ledger/util"
+	"github.com/hyperledger/fabric/internal/pkg/txflags"
+	mspmgmt "github.com/hyperledger/fabric/msp/mgmt"
+	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
 	"google.golang.org/protobuf/proto"
 )
@@ -44,6 +51,8 @@ type LockBasedTxMgr struct {
 	oldBlockCommit      sync.Mutex
 	currentUpdates      *currentUpdates
 	hashFunc            rwsetutil.HashFunc
+	stateConsistency    *stateconsistency.Policy
+	relaxedState        *relaxedstate.DB
 }
 
 // pvtdataPurgeMgr wraps the actual purge manager and an additional flag 'usedOnce'
@@ -82,6 +91,7 @@ func (c *currentUpdates) purgeAppInitiatedPvtKeys(keys map[privacyenabledstate.P
 // Initializer captures the dependencies for tx manager
 type Initializer struct {
 	LedgerID            string
+	RelaxedStateDBPath  string
 	DB                  *privacyenabledstate.DB
 	StateListeners      []ledger.StateListener
 	BtlPolicy           pvtdatapolicy.BTLPolicy
@@ -89,6 +99,7 @@ type Initializer struct {
 	CCInfoProvider      ledger.DeployedChaincodeInfoProvider
 	CustomTxProcessors  map[common.HeaderType]ledger.CustomTxProcessor
 	HashFunc            rwsetutil.HashFunc
+	StateConsistency    *stateconsistency.Policy
 }
 
 // NewLockBasedTxMgr constructs a new instance of NewLockBasedTxMgr
@@ -100,12 +111,40 @@ func NewLockBasedTxMgr(initializer *Initializer) (*LockBasedTxMgr, error) {
 	if err := initializer.DB.Open(); err != nil {
 		return nil, err
 	}
+	consistencyPolicy := initializer.StateConsistency
+	if consistencyPolicy == nil {
+		consistencyPolicy, _ = stateconsistency.NewPolicy(nil)
+	}
+	relaxedDB := relaxedstate.NewDB(
+		filepath.Join(initializer.RelaxedStateDBPath, initializer.LedgerID),
+		initializer.LedgerID,
+		func(evidence *relaxedstate.SignedEvidence) error {
+			identity, err := mspmgmt.GetManagerForChain(initializer.LedgerID).DeserializeIdentity(evidence.Endorser)
+			if err != nil {
+				return err
+			}
+			signingBytes, err := evidence.SigningBytes()
+			if err != nil {
+				return err
+			}
+			return identity.Verify(signingBytes, evidence.Signature)
+		},
+	)
 	txmgr := &LockBasedTxMgr{
-		ledgerid:       initializer.LedgerID,
-		db:             initializer.DB,
-		stateListeners: initializer.StateListeners,
-		ccInfoProvider: initializer.CCInfoProvider,
-		hashFunc:       initializer.HashFunc,
+		ledgerid:         initializer.LedgerID,
+		db:               initializer.DB,
+		stateListeners:   initializer.StateListeners,
+		ccInfoProvider:   initializer.CCInfoProvider,
+		hashFunc:         initializer.HashFunc,
+		stateConsistency: consistencyPolicy,
+		relaxedState:     relaxedDB,
+	}
+	if consistencyPolicy.Enabled() {
+		logger.Infof(
+			"GraND state consistency policy enabled: manifest=%s sha256=%s",
+			consistencyPolicy.ManifestPath(),
+			consistencyPolicy.ManifestHash(),
+		)
 	}
 	pvtstatePurgeMgr, err := pvtstatepurgemgmt.InstantiatePurgeMgr(
 		initializer.LedgerID,
@@ -188,6 +227,7 @@ func (txmgr *LockBasedTxMgr) ValidateAndPrepare(blockAndPvtdata *ledger.BlockAnd
 
 	block := blockAndPvtdata.Block
 	logger.Debugf("Validating new block with num trans = [%d]", len(block.Data.Data))
+	txmgr.validateRelaxedStateEvidence(block)
 	batch, appPurgeUpdates, txstatsInfo, err := txmgr.commitBatchPreparer.ValidateAndPrepareBatch(blockAndPvtdata, doMVCCValidation)
 	if err != nil {
 		txmgr.reset()
@@ -497,6 +537,7 @@ func (txmgr *LockBasedTxMgr) Shutdown() {
 	// see FAB-11974
 	txmgr.pvtdataPurgeMgr.WaitForPrepareToFinish()
 	txmgr.db.Close()
+	txmgr.relaxedState.Close()
 }
 
 // UpdateBatchWithAppInitiatedPvtKeysToPurge adds delete markers in the state update batch for the private data keys that
@@ -555,6 +596,10 @@ func (txmgr *LockBasedTxMgr) Commit() error {
 		txmgr.commitRWLock.Unlock()
 		return err
 	}
+	if err := txmgr.commitRelaxedState(txmgr.currentUpdates.block); err != nil {
+		txmgr.commitRWLock.Unlock()
+		return err
+	}
 	txmgr.commitRWLock.Unlock()
 	// only while holding a lock on oldBlockCommit, we should clear the cache as the
 	// cache is being used by the old pvtData committer to load the version of
@@ -569,6 +614,55 @@ func (txmgr *LockBasedTxMgr) Commit() error {
 	// In the case of error state listeners will not receive this call - instead a peer panic is caused by the ledger upon receiving
 	// an error from this function
 	txmgr.updateStateListeners()
+	return nil
+}
+
+func (txmgr *LockBasedTxMgr) validateRelaxedStateEvidence(block *common.Block) {
+	if block == nil || block.Data == nil || block.Metadata == nil ||
+		len(block.Metadata.Metadata) <= int(common.BlockMetadataIndex_TRANSACTIONS_FILTER) {
+		return
+	}
+	flags := txflags.ValidationFlags(block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
+	for index, transaction := range block.Data.Data {
+		if flags.IsInvalid(index) {
+			continue
+		}
+		txID, err := protoutil.GetOrComputeTxIDFromEnvelope(transaction)
+		if err != nil {
+			continue
+		}
+		bundle, err := protoutil.GetGrandRelaxedEvidenceFromEnvelope(transaction)
+		if err == nil {
+			err = txmgr.relaxedState.Validate(txID, bundle)
+		}
+		if err != nil {
+			logger.Warningf("invalid GraND relaxed-state evidence: txid=%s error=%s", txID, err)
+			flags.SetFlag(index, peer.TxValidationCode_INVALID_OTHER_REASON)
+		}
+	}
+}
+
+func (txmgr *LockBasedTxMgr) commitRelaxedState(block *common.Block) error {
+	if block == nil || block.Data == nil || block.Metadata == nil ||
+		len(block.Metadata.Metadata) <= int(common.BlockMetadataIndex_TRANSACTIONS_FILTER) {
+		return nil
+	}
+	flags := txflags.ValidationFlags(block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
+	for index, transaction := range block.Data.Data {
+		txID, err := protoutil.GetOrComputeTxIDFromEnvelope(transaction)
+		if err != nil {
+			continue
+		}
+		if flags.IsInvalid(index) {
+			if err := txmgr.relaxedState.Discard(txID); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := txmgr.relaxedState.Commit(txID, block.Header.Number); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

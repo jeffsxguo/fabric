@@ -11,6 +11,7 @@ import (
 	"github.com/hyperledger/fabric-protos-go-apiv2/ledger/rwset/kvrwset"
 	commonledger "github.com/hyperledger/fabric/common/ledger"
 	"github.com/hyperledger/fabric/core/ledger"
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	"github.com/hyperledger/fabric/core/ledger/internal/version"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statedb"
@@ -69,6 +70,10 @@ func (q *queryExecutor) getState(ns, key string) ([]byte, []byte, error) {
 	if err := q.checkDone(); err != nil {
 		return nil, nil, err
 	}
+	if level, explicit := q.txmgr.stateConsistency.Resolve(ns, key); explicit && level == stateconsistency.Relaxed {
+		value, err := q.txmgr.relaxedState.Get(ns, key)
+		return value, []byte(stateconsistency.Relaxed), err
+	}
 	versionedValue, err := q.txmgr.db.GetState(ns, key)
 	if err != nil {
 		return nil, nil, err
@@ -84,6 +89,9 @@ func (q *queryExecutor) getState(ns, key string) ([]byte, []byte, error) {
 func (q *queryExecutor) GetStateMetadata(ns, key string) (map[string][]byte, error) {
 	if err := q.checkDone(); err != nil {
 		return nil, err
+	}
+	if level, explicit := q.txmgr.stateConsistency.Resolve(ns, key); explicit && level == stateconsistency.Relaxed {
+		return stateconsistency.WithLevel(nil, stateconsistency.Relaxed)
 	}
 	var metadata []byte
 	var err error
@@ -104,17 +112,13 @@ func (q *queryExecutor) GetStateMultipleKeys(ns string, keys []string) ([][]byte
 	if err := q.checkDone(); err != nil {
 		return nil, err
 	}
-	versionedValues, err := q.txmgr.db.GetStateMultipleKeys(ns, keys)
-	if err != nil {
-		return nil, nil
-	}
-	values := make([][]byte, len(versionedValues))
-	for i, versionedValue := range versionedValues {
-		val, _, ver := decomposeVersionedValue(versionedValue)
-		if q.collectReadset {
-			q.rwsetBuilder.AddToReadSet(ns, keys[i], ver)
+	values := make([][]byte, len(keys))
+	for index, key := range keys {
+		value, err := q.GetState(ns, key)
+		if err != nil {
+			return nil, err
 		}
-		values[i] = val
+		values[index] = value
 	}
 	return values, nil
 }

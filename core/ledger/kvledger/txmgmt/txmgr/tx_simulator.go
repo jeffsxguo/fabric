@@ -7,10 +7,14 @@ SPDX-License-Identifier: Apache-2.0
 package txmgr
 
 import (
+	"sort"
+
 	commonledger "github.com/hyperledger/fabric/common/ledger"
 	"github.com/hyperledger/fabric/core/ledger"
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statemetadata"
+	"github.com/hyperledger/fabric/core/ledger/relaxedstate"
 	"github.com/hyperledger/fabric/core/ledger/util"
 	"github.com/pkg/errors"
 )
@@ -24,13 +28,19 @@ type txSimulator struct {
 	simulationResultsComputed bool
 	paginatedQueriesPerformed bool
 	writesetMetadata          ledger.WritesetMetadata
+	relaxedWrites             map[string]relaxedstate.Write
 }
 
 func newTxSimulator(txmgr *LockBasedTxMgr, txid string, hashFunc rwsetutil.HashFunc) (*txSimulator, error) {
 	rwsetBuilder := rwsetutil.NewRWSetBuilder()
 	qe := newQueryExecutor(txmgr, txid, rwsetBuilder, true, hashFunc)
 	logger.Debugf("constructing new tx simulator txid = [%s]", txid)
-	return &txSimulator{qe, rwsetBuilder, false, false, false, false, ledger.WritesetMetadata{}}, nil
+	return &txSimulator{
+		queryExecutor:    qe,
+		rwsetBuilder:     rwsetBuilder,
+		writesetMetadata: ledger.WritesetMetadata{},
+		relaxedWrites:    map[string]relaxedstate.Write{},
+	}, nil
 }
 
 // SetState implements method in interface `ledger.TxSimulator`
@@ -38,9 +48,52 @@ func (s *txSimulator) SetState(ns string, key string, value []byte) error {
 	if err := s.checkWritePrecondition(key, value); err != nil {
 		return err
 	}
+	if level, explicit := s.txmgr.stateConsistency.Resolve(ns, key); explicit && level == stateconsistency.Relaxed {
+		s.relaxedWrites[ns+"\x00"+key] = relaxedstate.Write{
+			Namespace: ns,
+			Key:       key,
+			Value:     append([]byte(nil), value...),
+			Delete:    value == nil,
+		}
+		return nil
+	}
 	s.rwsetBuilder.AddToWriteSet(ns, key, value)
 	// if this has a key level signature policy, add it to the interest
-	return s.checkStateMetadata(ns, key)
+	if err := s.checkStateMetadata(ns, key); err != nil {
+		return err
+	}
+	if value == nil {
+		return nil
+	}
+	return s.applyStateConsistency(ns, key)
+}
+
+func (s *txSimulator) applyStateConsistency(namespace, key string) error {
+	level, explicit := s.txmgr.stateConsistency.Resolve(namespace, key)
+	if !explicit {
+		return nil
+	}
+	metadata, err := s.currentStateMetadata(namespace, key)
+	if err != nil {
+		return err
+	}
+	metadata, err = stateconsistency.WithLevel(metadata, level)
+	if err != nil {
+		return err
+	}
+	s.rwsetBuilder.AddToMetadataWriteSet(namespace, key, metadata)
+	return nil
+}
+
+func (s *txSimulator) currentStateMetadata(namespace, key string) (map[string][]byte, error) {
+	if metadata, pending := s.rwsetBuilder.GetMetadataWriteSet(namespace, key); pending {
+		return metadata, nil
+	}
+	// The consistency write preserves other metadata entries, so it is a
+	// read-modify-write operation. Read through the query executor to include
+	// the key version in the MVCC read set and avoid losing a concurrent SBE or
+	// metadata update.
+	return s.queryExecutor.GetStateMetadata(namespace, key)
 }
 
 // If this key has a SBE policy, add that policy to the set
@@ -90,6 +143,39 @@ func (s *txSimulator) SetStateMultipleKeys(namespace string, kvs map[string][]by
 func (s *txSimulator) SetStateMetadata(namespace, key string, metadata map[string][]byte) error {
 	if err := s.checkWritePrecondition(key, nil); err != nil {
 		return err
+	}
+	if level, explicit := s.txmgr.stateConsistency.Resolve(namespace, key); explicit && level == stateconsistency.Relaxed {
+		for metadataKey := range metadata {
+			if metadataKey != stateconsistency.MetadataKey {
+				return errors.Errorf("metadata %q is not supported for peer-local relaxed state", metadataKey)
+			}
+		}
+		return nil
+	}
+	if level, ok := metadata[stateconsistency.MetadataKey]; ok {
+		if _, err := stateconsistency.ParseLevelBytes(level); err != nil {
+			return err
+		}
+	}
+	if level, explicit := s.txmgr.stateConsistency.Resolve(namespace, key); explicit {
+		currentMetadata, err := s.currentStateMetadata(namespace, key)
+		if err != nil {
+			return err
+		}
+		if metadata == nil {
+			currentMetadata = nil
+		} else {
+			if currentMetadata == nil {
+				currentMetadata = map[string][]byte{}
+			}
+			for metadataKey, metadataValue := range metadata {
+				currentMetadata[metadataKey] = append([]byte(nil), metadataValue...)
+			}
+		}
+		metadata, err = stateconsistency.WithLevel(currentMetadata, level)
+		if err != nil {
+			return err
+		}
 	}
 	s.rwsetBuilder.AddToMetadataWriteSet(namespace, key, metadata)
 	return s.checkStateMetadata(namespace, key)
@@ -207,10 +293,39 @@ func (s *txSimulator) GetTxSimulationResults() (*ledger.TxSimulationResults, err
 	if err != nil {
 		return nil, err
 	}
+	if err := s.txmgr.relaxedState.Stage(s.GrandRelaxedStateSimulation()); err != nil {
+		return nil, err
+	}
 	// The txSimulator structures need to be cloned so that subsequent RW set additions don't modify these TX simulation results
 	simResults.PrivateReads = s.privateReads.Clone()
 	simResults.WritesetMetadata = s.writesetMetadata.Clone()
 	return simResults, nil
+}
+
+// GrandRelaxedStateSimulation returns the peer-specific writes excluded from
+// Fabric's canonical RWSet. The endorser signs this payload separately.
+func (s *txSimulator) GrandRelaxedStateSimulation() *relaxedstate.Simulation {
+	writes := make([]relaxedstate.Write, 0, len(s.relaxedWrites))
+	for _, write := range s.relaxedWrites {
+		writes = append(writes, write)
+	}
+	sort.Slice(writes, func(i, j int) bool {
+		if writes[i].Namespace == writes[j].Namespace {
+			return writes[i].Key < writes[j].Key
+		}
+		return writes[i].Namespace < writes[j].Namespace
+	})
+	return &relaxedstate.Simulation{
+		ChannelID: s.txmgr.ledgerid,
+		TxID:      s.txid,
+		Writes:    writes,
+	}
+}
+
+// StoreGrandRelaxedStateEvidence persists this peer's individual endorsement
+// so V-stage validation can match it to the staged local delta.
+func (s *txSimulator) StoreGrandRelaxedStateEvidence(evidence *relaxedstate.SignedEvidence) error {
+	return s.txmgr.relaxedState.StoreEvidence(s.txid, evidence)
 }
 
 // ExecuteUpdate implements method in interface `ledger.TxSimulator`

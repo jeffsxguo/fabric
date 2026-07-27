@@ -101,6 +101,7 @@ func (env *lockBasedEnv) init(t *testing.T, testLedgerID string, btlPolicy pvtda
 
 	txmgrInitializer := &Initializer{
 		LedgerID:            testLedgerID,
+		RelaxedStateDBPath:  t.TempDir(),
 		DB:                  env.testDB,
 		StateListeners:      nil,
 		BtlPolicy:           btlPolicy,

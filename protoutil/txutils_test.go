@@ -7,6 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 package protoutil_test
 
 import (
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"strconv"
@@ -489,6 +490,62 @@ func TestGetProposalHash2(t *testing.T) {
 
 	_, err = protoutil.GetProposalHash2(&cb.Header{}, []byte("ccproppayload"))
 	require.Error(t, err, "Expected error with nil arguments")
+}
+
+func TestGrandRelaxedEvidenceIsCarriedButExcludedFromProposalHash(t *testing.T) {
+	hdr := &cb.Header{
+		ChannelHeader:   []byte("chdr"),
+		SignatureHeader: []byte("shdr"),
+	}
+	plainPayload := protoutil.MarshalOrPanic(&pb.ChaincodeProposalPayload{Input: []byte("invoke")})
+	evidencePayload := protoutil.MarshalOrPanic(&pb.ChaincodeProposalPayload{
+		Input: []byte("invoke"),
+		TransientMap: map[string][]byte{
+			protoutil.GrandRelaxedEvidenceTransientKey: []byte("bundle"),
+		},
+	})
+	plainHash, err := protoutil.GetProposalHash2(hdr, plainPayload)
+	require.NoError(t, err)
+	evidenceHash, err := protoutil.GetProposalHash2(hdr, evidencePayload)
+	require.NoError(t, err)
+	require.Equal(t, plainHash, evidenceHash)
+
+	signer := &fakes.SignerSerializer{}
+	signer.SerializeReturns([]byte("creator"), nil)
+	proposal := &pb.Proposal{
+		Header: protoutil.MarshalOrPanic(&cb.Header{
+			ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{}),
+			SignatureHeader: protoutil.MarshalOrPanic(&cb.SignatureHeader{
+				Creator: []byte("creator"),
+			}),
+		}),
+		Payload: plainPayload,
+	}
+	responses := []*pb.ProposalResponse{
+		{
+			Payload:     []byte("canonical"),
+			Endorsement: &pb.Endorsement{Endorser: []byte("org1")},
+			Response: &pb.Response{
+				Status:  200,
+				Message: protoutil.GrandRelaxedEvidenceMessagePrefix + base64.StdEncoding.EncodeToString([]byte("evidence-1")),
+			},
+		},
+		{
+			Payload:     []byte("canonical"),
+			Endorsement: &pb.Endorsement{Endorser: []byte("org2")},
+			Response: &pb.Response{
+				Status:  200,
+				Message: protoutil.GrandRelaxedEvidenceMessagePrefix + base64.StdEncoding.EncodeToString([]byte("evidence-2")),
+			},
+		},
+	}
+	envelope, err := protoutil.CreateSignedTx(proposal, signer, responses...)
+	require.NoError(t, err)
+	envelopeBytes, err := proto.Marshal(envelope)
+	require.NoError(t, err)
+	bundle, err := protoutil.GetGrandRelaxedEvidenceFromEnvelope(envelopeBytes)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("evidence-1"), []byte("evidence-2")}, bundle)
 }
 
 func TestGetProposalHash1(t *testing.T) {

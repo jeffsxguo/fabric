@@ -8,6 +8,7 @@ package endorser
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"strconv"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/hyperledger/fabric/core/chaincode/lifecycle"
 	"github.com/hyperledger/fabric/core/common/ccprovider"
 	"github.com/hyperledger/fabric/core/ledger"
+	"github.com/hyperledger/fabric/core/ledger/relaxedstate"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/hyperledger/fabric/msp"
 	"github.com/hyperledger/fabric/protoutil"
@@ -101,6 +103,11 @@ type Endorser struct {
 	Support                Support
 	PvtRWSetAssembler      PvtRWSetAssembler
 	Metrics                *Metrics
+}
+
+type grandRelaxedStateSimulator interface {
+	GrandRelaxedStateSimulation() *relaxedstate.Simulation
+	StoreGrandRelaxedStateEvidence(*relaxedstate.SignedEvidence) error
 }
 
 // call specified chaincode (system or user)
@@ -466,11 +473,42 @@ func (e *Endorser) ProcessProposalSuccessfullyOrError(up *UnpackedProposal) (*pb
 		return nil, errors.WithMessage(err, "endorsing with plugin failed")
 	}
 
+	response := proto.Clone(res).(*pb.Response)
+	if relaxedSimulator, ok := txParams.TXSimulator.(grandRelaxedStateSimulator); ok {
+		simulation := relaxedSimulator.GrandRelaxedStateSimulation()
+		if simulation != nil && len(simulation.Writes) > 0 {
+			canonicalHash := sha256.Sum256(mPrpBytes)
+			payload := relaxedstate.NewEvidencePayload(simulation, up.ProposalHash, canonicalHash[:])
+			identity, err := e.Support.Serialize()
+			if err != nil {
+				return nil, errors.Wrap(err, "serialize local relaxed-state endorser")
+			}
+			evidence := &relaxedstate.SignedEvidence{Payload: payload, Endorser: identity}
+			signingBytes, err := evidence.SigningBytes()
+			if err != nil {
+				return nil, errors.Wrap(err, "marshal local relaxed-state endorsement payload")
+			}
+			evidence.Signature, err = e.Support.Sign(signingBytes)
+			if err != nil {
+				return nil, errors.Wrap(err, "sign local relaxed-state endorsement")
+			}
+			if err := relaxedSimulator.StoreGrandRelaxedStateEvidence(evidence); err != nil {
+				return nil, errors.Wrap(err, "store local relaxed-state endorsement")
+			}
+			message, err := relaxedstate.EvidenceMessage(evidence)
+			if err != nil {
+				return nil, errors.Wrap(err, "encode local relaxed-state endorsement")
+			}
+			response.Message = protoutil.GrandRelaxedEvidenceMessagePrefix + message
+			logger.Infof("GraND local-state endorsement created: txid=%s relaxed-writes=%d", up.TxID(), len(simulation.Writes))
+		}
+	}
+
 	return &pb.ProposalResponse{
 		Version:     1,
 		Endorsement: endorsement,
 		Payload:     mPrpBytes,
-		Response:    res,
+		Response:    response,
 		Interest:    ccInterest,
 	}, nil
 }

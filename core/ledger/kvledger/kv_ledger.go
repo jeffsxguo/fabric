@@ -24,6 +24,7 @@ import (
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/cceventmgmt"
 	"github.com/hyperledger/fabric/core/ledger/confighistory"
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	"github.com/hyperledger/fabric/core/ledger/internal/version"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/bookkeeping"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/history"
@@ -124,9 +125,18 @@ func newKVLedger(initializer *lgrInitializer) (*kvLedger, error) {
 		}
 		return hash.Sum(nil), nil
 	}
+	var consistencyConfig *stateconsistency.Config
+	if initializer.config.StateDBConfig != nil {
+		consistencyConfig = initializer.config.StateDBConfig.Consistency
+	}
+	consistencyPolicy, policyErr := stateconsistency.LoadPolicy(consistencyConfig)
+	if policyErr != nil {
+		return nil, errors.Wrap(policyErr, "load state consistency policy")
+	}
 
 	txmgrInitializer := &txmgr.Initializer{
 		LedgerID:            ledgerID,
+		RelaxedStateDBPath:  RelaxedStateDBPath(initializer.config.RootFSPath),
 		DB:                  initializer.stateDB,
 		StateListeners:      initializer.stateListeners,
 		BtlPolicy:           btlPolicy,
@@ -134,6 +144,7 @@ func newKVLedger(initializer *lgrInitializer) (*kvLedger, error) {
 		CCInfoProvider:      initializer.ccInfoProvider,
 		CustomTxProcessors:  initializer.customTxProcessors,
 		HashFunc:            rwsetHashFunc,
+		StateConsistency:    consistencyPolicy,
 	}
 	if err := l.initTxMgr(txmgrInitializer); err != nil {
 		return nil, err
