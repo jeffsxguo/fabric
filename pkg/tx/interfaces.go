@@ -12,6 +12,7 @@ import (
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	"github.com/hyperledger/fabric/pkg/statedata"
 )
 
@@ -191,6 +192,18 @@ func (s *State) SetState(ns, key string, value []byte) error {
 // This function is a noop for a non existing key. A nil metadata implied the delete of the metadata
 func (s *State) SetStateMetadata(ns, key string, metadata map[string][]byte) error {
 	return s.BackingState.SetStateMetadata(ns, key, metadata)
+}
+
+// GetStateConsistencyLevel returns the per-state GraND consistency
+// classification. State without explicit metadata is normal.
+func (s *State) GetStateConsistencyLevel(ns, key string) (stateconsistency.Level, error) {
+	return stateconsistency.GetStateLevel(s.BackingState, ns, key)
+}
+
+// SetStateConsistencyLevel writes a per-state GraND consistency
+// classification while preserving other Fabric state metadata.
+func (s *State) SetStateConsistencyLevel(ns, key string, level stateconsistency.Level) error {
+	return stateconsistency.SetStateLevel(s.BackingState, s.BackingState, ns, key, level)
 }
 
 // GetPrivateDataMetadataByHash returns the metadata associated with a tuple <namespace, collection, keyhash>

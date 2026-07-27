@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/ledger/rwset/kvrwset"
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,4 +31,18 @@ func TestSerializeDeSerialize(t *testing.T) {
 		"metadata_3": []byte("metadata_value_3"),
 	}
 	require.Equal(t, expectedMetadata, deserializedMetadata)
+}
+
+func TestDeserializeConsistencyLevel(t *testing.T) {
+	level, err := DeserializeConsistencyLevel(nil)
+	require.NoError(t, err)
+	require.Equal(t, stateconsistency.Normal, level)
+
+	serializedMetadata, err := Serialize([]*kvrwset.KVMetadataEntry{
+		{Name: stateconsistency.MetadataKey, Value: []byte(stateconsistency.Normal)},
+	})
+	require.NoError(t, err)
+	level, err = DeserializeConsistencyLevel(serializedMetadata)
+	require.NoError(t, err)
+	require.Equal(t, stateconsistency.Normal, level)
 }

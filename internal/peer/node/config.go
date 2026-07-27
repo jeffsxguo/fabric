@@ -12,6 +12,7 @@ import (
 
 	coreconfig "github.com/hyperledger/fabric/core/config"
 	"github.com/hyperledger/fabric/core/ledger"
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	"github.com/spf13/viper"
 )
 
@@ -71,6 +72,11 @@ func ledgerConfig() *ledger.Config {
 		SnapshotsConfig: &ledger.SnapshotsConfig{
 			RootDir: snapshotsRootDir,
 		},
+	}
+	if manifestPath := viper.GetString("ledger.state.consistency.manifest"); manifestPath != "" {
+		conf.StateDBConfig.Consistency = &stateconsistency.Config{
+			ManifestPath: coreconfig.GetPath("ledger.state.consistency.manifest"),
+		}
 	}
 
 	if conf.StateDBConfig.StateDatabase == ledger.CouchDB {

@@ -8,6 +8,7 @@ package statemetadata
 
 import (
 	"github.com/hyperledger/fabric-protos-go-apiv2/ledger/rwset/kvrwset"
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -31,4 +32,14 @@ func Deserialize(metadataBytes []byte) (map[string][]byte, error) {
 		m[metadataEntry.Name] = metadataEntry.Value
 	}
 	return m, nil
+}
+
+// DeserializeConsistencyLevel returns the GraND consistency level stored in
+// serialized state metadata. Missing metadata is interpreted as normal.
+func DeserializeConsistencyLevel(metadataBytes []byte) (stateconsistency.Level, error) {
+	metadata, err := Deserialize(metadataBytes)
+	if err != nil {
+		return "", err
+	}
+	return stateconsistency.FromMetadata(metadata)
 }

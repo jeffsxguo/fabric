@@ -16,11 +16,13 @@ import (
 	"github.com/hyperledger/fabric/core/common/ccprovider"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/cceventmgmt"
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	"github.com/hyperledger/fabric/core/ledger/internal/version"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/bookkeeping"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statedb"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statedb/statecouchdb"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statedb/stateleveldb"
+	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statemetadata"
 	"github.com/hyperledger/fabric/core/ledger/util"
 	"github.com/pkg/errors"
 )
@@ -278,6 +280,16 @@ func (s *DB) GetStateMetadata(namespace, key string) ([]byte, error) {
 		return nil, err
 	}
 	return vv.Metadata, nil
+}
+
+// GetStateConsistencyLevel returns the GraND consistency classification for a
+// public world-state key. State without an explicit classification is normal.
+func (s *DB) GetStateConsistencyLevel(namespace, key string) (stateconsistency.Level, error) {
+	metadata, err := s.GetStateMetadata(namespace, key)
+	if err != nil {
+		return "", err
+	}
+	return statemetadata.DeserializeConsistencyLevel(metadata)
 }
 
 // GetPrivateDataMetadataByHash implements corresponding function in interface DB. For additional details, see

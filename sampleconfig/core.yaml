@@ -687,6 +687,13 @@ ledger:
     stateDatabase: goleveldb
     # Limit on the number of records to return per query
     totalQueryLimit: 100000
+    consistency:
+      # Optional GraND per-state consistency manifest. When empty, existing
+      # Fabric state remains backward compatible and is interpreted as normal.
+      # Normal currently continues to use standard Fabric E-O-V semantics.
+      # The manifest assigns strong, normal, or relaxed to public world-state
+      # keys by chaincode namespace, exact key, or key prefix.
+      manifest:
     couchDBConfig:
       # It is recommended to run CouchDB on the same server as the peer, and
       # not map the CouchDB container port to a server port in docker-compose.

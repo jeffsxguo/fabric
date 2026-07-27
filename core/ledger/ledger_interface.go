@@ -19,6 +19,7 @@ import (
 	"github.com/hyperledger/fabric-protos-go-apiv2/ledger/rwset/kvrwset"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	commonledger "github.com/hyperledger/fabric/common/ledger"
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	"github.com/pkg/errors"
 	"google.golang.org/protobuf/proto"
 )
@@ -63,6 +64,10 @@ type StateDBConfig struct {
 	// CouchDB is the configuration for CouchDB.  It is used when StateDatabase
 	// is set to "CouchDB".
 	CouchDB *CouchDBConfig
+	// Consistency optionally configures GraND per-state consistency
+	// classification. A nil config preserves upstream Fabric behavior and
+	// treats unlabelled state as implicitly normal.
+	Consistency *stateconsistency.Config
 }
 
 // CouchDBConfig is a structure used to configure a CouchInstance.

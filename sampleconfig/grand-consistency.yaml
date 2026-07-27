@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# GraND per-state consistency manifest, version 1.
+#
+# An unlabelled namespace/key is implicitly normal. To make every application
+# state explicit, add one namespace rule and override individual keys or key
+# prefixes. Exact keys take precedence over prefixes, and the longest matching
+# prefix takes precedence over the namespace rule.
+version: 1
+defaultLevel: normal
+rules:
+  # All other keys written by the "basic" chaincode are normal.
+  - namespace: basic
+    level: normal
+
+  # Example groups for manual/offline state classification.
+  - namespace: basic
+    keyPrefix: "normal:"
+    level: normal
+
+  - namespace: basic
+    keyPrefix: "relaxed:"
+    level: relaxed
+
+  # An exact-key rule overrides both prefix and namespace rules.
+  - namespace: basic
+    key: "relaxed:certified-output"
+    level: strong

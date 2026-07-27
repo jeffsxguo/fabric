@@ -165,3 +165,18 @@ func TestLedgerConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestLedgerConfigStateConsistencyManifest(t *testing.T) {
+	defer viper.Reset()
+	viper.Set("peer.fileSystemPath", "/peerfs")
+	viper.Set("ledger.state.stateDatabase", "goleveldb")
+	viper.Set("ledger.state.consistency.manifest", "/policies/grand-consistency.yaml")
+
+	config := ledgerConfig()
+	require.NotNil(t, config.StateDBConfig.Consistency)
+	require.Equal(
+		t,
+		"/policies/grand-consistency.yaml",
+		config.StateDBConfig.Consistency.ManifestPath,
+	)
+}

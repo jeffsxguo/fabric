@@ -9,7 +9,9 @@ package statedb
 import (
 	"sort"
 
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	"github.com/hyperledger/fabric/core/ledger/internal/version"
+	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statemetadata"
 	"github.com/hyperledger/fabric/core/ledger/util"
 )
 
@@ -134,6 +136,16 @@ type VersionedValue struct {
 // IsDelete returns true if this update indicates delete of a key
 func (vv *VersionedValue) IsDelete() bool {
 	return vv.Value == nil
+}
+
+// StateConsistencyLevel returns the GraND consistency classification carried
+// by this versioned value. Missing values and values created before the
+// feature was enabled are interpreted as normal.
+func (vv *VersionedValue) StateConsistencyLevel() (stateconsistency.Level, error) {
+	if vv == nil {
+		return stateconsistency.Normal, nil
+	}
+	return statemetadata.DeserializeConsistencyLevel(vv.Metadata)
 }
 
 // VersionedKV encloses key and corresponding VersionedValue

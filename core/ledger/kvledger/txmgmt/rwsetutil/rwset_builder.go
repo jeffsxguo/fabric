@@ -92,6 +92,28 @@ func (b *RWSetBuilder) AddToMetadataWriteSet(ns, key string, metadata map[string
 		metadataWriteMap[key] = mapToMetadataWrite(key, metadata)
 }
 
+// GetMetadataWriteSet returns a copy of a pending public metadata write. The
+// boolean is false when no metadata write has been recorded for the key. A nil
+// map with a true boolean represents a pending deletion of all metadata.
+func (b *RWSetBuilder) GetMetadataWriteSet(ns, key string) (map[string][]byte, bool) {
+	nsBuilder, ok := b.pubRwBuilderMap[ns]
+	if !ok {
+		return nil, false
+	}
+	metadataWrite, ok := nsBuilder.metadataWriteMap[key]
+	if !ok {
+		return nil, false
+	}
+	if metadataWrite.Entries == nil {
+		return nil, true
+	}
+	metadata := make(map[string][]byte, len(metadataWrite.Entries))
+	for _, entry := range metadataWrite.Entries {
+		metadata[entry.Name] = append([]byte(nil), entry.Value...)
+	}
+	return metadata, true
+}
+
 // AddToRangeQuerySet adds a range query info for performing phantom read validation
 func (b *RWSetBuilder) AddToRangeQuerySet(ns string, rqi *kvrwset.RangeQueryInfo) {
 	nsPubRwBuilder := b.getOrCreateNsPubRwBuilder(ns)
