@@ -16,6 +16,7 @@ import (
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statedb"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statemetadata"
+	"github.com/hyperledger/fabric/core/ledger/relaxedstate"
 	"github.com/hyperledger/fabric/core/ledger/util"
 	"github.com/pkg/errors"
 )
@@ -37,6 +38,7 @@ type queryExecutor struct {
 	hasher            rwsetutil.HashFunc
 	txid              string
 	privateReads      *ledger.PrivateReads
+	relaxedReads      map[string]relaxedstate.Read
 }
 
 func newQueryExecutor(txmgr *LockBasedTxMgr,
@@ -57,6 +59,7 @@ func newQueryExecutor(txmgr *LockBasedTxMgr,
 	validator := newCollNameValidator(txmgr.ledgerid, txmgr.ccInfoProvider, qe, !performCollCheck)
 	qe.collNameValidator = validator
 	qe.privateReads = &ledger.PrivateReads{}
+	qe.relaxedReads = map[string]relaxedstate.Read{}
 	return qe
 }
 
@@ -72,6 +75,13 @@ func (q *queryExecutor) getState(ns, key string) ([]byte, []byte, error) {
 	}
 	if level, explicit := q.txmgr.stateConsistency.Resolve(ns, key); explicit && level == stateconsistency.Relaxed {
 		value, err := q.txmgr.relaxedState.Get(ns, key)
+		if err == nil && q.collectReadset {
+			q.relaxedReads[ns+"\x00"+key] = relaxedstate.Read{
+				Namespace: ns,
+				Key:       key,
+				Value:     append([]byte(nil), value...),
+			}
+		}
 		return value, []byte(stateconsistency.Relaxed), err
 	}
 	versionedValue, err := q.txmgr.db.GetState(ns, key)

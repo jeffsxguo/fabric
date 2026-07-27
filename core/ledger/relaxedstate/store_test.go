@@ -9,6 +9,7 @@ package relaxedstate
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"testing"
 
@@ -51,8 +52,8 @@ func TestStageValidateAndCommitPeerLocalValue(t *testing.T) {
 
 	encodedEvidence, err := json.Marshal(evidence)
 	require.NoError(t, err)
-	require.NoError(t, db.Validate("tx1", [][]byte{encodedEvidence}))
-	require.NoError(t, db.Commit("tx1", 7))
+	require.NoError(t, db.Validate("tx1", [][]byte{encodedEvidence}, nil))
+	require.NoError(t, db.Commit("tx1", 7, nil))
 
 	value, err := db.Get("grandmarket", "quote:BTC-USD")
 	require.NoError(t, err)
@@ -83,14 +84,57 @@ func TestRejectsChangedOrOmittedLocalEvidence(t *testing.T) {
 	}
 	require.NoError(t, db.StoreEvidence("tx1", evidence))
 
-	err := db.Validate("tx1", nil)
+	err := db.Validate("tx1", nil, nil)
 	require.ErrorContains(t, err, "omits this peer's local endorsement")
 
 	evidence.Payload.Writes[0].Value = []byte("999")
 	changed, err := json.Marshal(evidence)
 	require.NoError(t, err)
-	err = db.Validate("tx1", [][]byte{changed})
+	err = db.Validate("tx1", [][]byte{changed}, nil)
 	require.ErrorContains(t, err, "value hash mismatch")
+}
+
+func TestActiveSyncCommitsCertifiedValue(t *testing.T) {
+	db := NewDB(t.TempDir(), "mychannel", nil)
+	defer db.Close()
+
+	localValue := []byte(`{"symbol":"BTC-USD","sourceId":"source-a","price":101}`)
+	simulation := &Simulation{
+		ChannelID: "mychannel",
+		TxID:      "sync1",
+		Purpose:   ActiveSyncPurpose,
+		Reads: []Read{
+			{Namespace: "grandmarket", Key: "quote:BTC-USD", Value: localValue},
+		},
+	}
+	require.NoError(t, db.Stage(simulation))
+	evidence := &SignedEvidence{
+		Payload:   NewEvidencePayload(simulation, nil, nil),
+		Endorser:  []byte("peer"),
+		Signature: []byte("signature"),
+	}
+	require.NoError(t, db.StoreEvidence("sync1", evidence))
+	encoded, err := json.Marshal(evidence)
+	require.NoError(t, err)
+
+	median := []byte(`{"symbol":"BTC-USD","sourceId":"source-b","price":103}`)
+	hash := sha256.Sum256(median)
+	result := &ActiveSyncResult{
+		Namespace: "grandmarket",
+		Key:       "quote:BTC-USD",
+		Value:     median,
+		ValueHash: hash[:],
+		Algorithm: MedianJSONPriceAlgorithm,
+	}
+	require.NoError(t, db.Validate("sync1", [][]byte{encoded}, result))
+	require.NoError(t, db.Commit("sync1", 8, result))
+
+	value, err := db.Get("grandmarket", "quote:BTC-USD")
+	require.NoError(t, err)
+	require.Equal(t, median, value)
+	record, err := db.GetRecord("grandmarket", "quote:BTC-USD")
+	require.NoError(t, err)
+	require.Equal(t, result, record.ActiveSync)
 }
 
 type errInvalidTestSignature struct{}

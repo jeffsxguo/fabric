@@ -107,6 +107,7 @@ type Endorser struct {
 
 type grandRelaxedStateSimulator interface {
 	GrandRelaxedStateSimulation() *relaxedstate.Simulation
+	StageGrandRelaxedStateSimulation(*relaxedstate.Simulation) error
 	StoreGrandRelaxedStateEvidence(*relaxedstate.SignedEvidence) error
 }
 
@@ -476,7 +477,17 @@ func (e *Endorser) ProcessProposalSuccessfullyOrError(up *UnpackedProposal) (*pb
 	response := proto.Clone(res).(*pb.Response)
 	if relaxedSimulator, ok := txParams.TXSimulator.(grandRelaxedStateSimulator); ok {
 		simulation := relaxedSimulator.GrandRelaxedStateSimulation()
-		if simulation != nil && len(simulation.Writes) > 0 {
+		activeSync := res.Message == protoutil.GrandActiveSyncRequestMessage
+		if activeSync {
+			if simulation == nil || len(simulation.Reads) != 1 || len(simulation.Writes) != 0 {
+				return nil, errors.New("GraND active sync requires exactly one relaxed read and no relaxed writes")
+			}
+			simulation.Purpose = relaxedstate.ActiveSyncPurpose
+			if err := relaxedSimulator.StageGrandRelaxedStateSimulation(simulation); err != nil {
+				return nil, errors.Wrap(err, "stage GraND active-sync read")
+			}
+		}
+		if simulation != nil && (len(simulation.Writes) > 0 || activeSync) {
 			canonicalHash := sha256.Sum256(mPrpBytes)
 			payload := relaxedstate.NewEvidencePayload(simulation, up.ProposalHash, canonicalHash[:])
 			identity, err := e.Support.Serialize()
@@ -500,7 +511,10 @@ func (e *Endorser) ProcessProposalSuccessfullyOrError(up *UnpackedProposal) (*pb
 				return nil, errors.Wrap(err, "encode local relaxed-state endorsement")
 			}
 			response.Message = protoutil.GrandRelaxedEvidenceMessagePrefix + message
-			logger.Infof("GraND local-state endorsement created: txid=%s relaxed-writes=%d", up.TxID(), len(simulation.Writes))
+			logger.Infof(
+				"GraND local-state endorsement created: txid=%s purpose=%s relaxed-reads=%d relaxed-writes=%d",
+				up.TxID(), payload.Purpose, len(simulation.Reads), len(simulation.Writes),
+			)
 		}
 	}
 

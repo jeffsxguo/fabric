@@ -7,15 +7,20 @@ SPDX-License-Identifier: Apache-2.0
 package protoutil_test
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
 
 	cb "github.com/hyperledger/fabric-protos-go-apiv2/common"
+	mspproto "github.com/hyperledger/fabric-protos-go-apiv2/msp"
 	pb "github.com/hyperledger/fabric-protos-go-apiv2/peer"
+	"github.com/hyperledger/fabric/core/ledger/relaxedstate"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/hyperledger/fabric/protoutil"
@@ -546,6 +551,62 @@ func TestGrandRelaxedEvidenceIsCarriedButExcludedFromProposalHash(t *testing.T) 
 	bundle, err := protoutil.GetGrandRelaxedEvidenceFromEnvelope(envelopeBytes)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte("evidence-1"), []byte("evidence-2")}, bundle)
+}
+
+func TestComputeGrandActiveSyncMedian(t *testing.T) {
+	prices := []int64{105, 101, 103}
+	mspIDs := []string{"Org3MSP", "Org1MSP", "Org2MSP"}
+	evidence := make([][]byte, 0, len(prices))
+	for index, price := range prices {
+		value := []byte(fmt.Sprintf(`{"symbol":"BTC-USD","sourceId":"source-%d","price":%d}`, index, price))
+		simulation := &relaxedstate.Simulation{
+			ChannelID: "mychannel",
+			TxID:      "sync-tx",
+			Purpose:   relaxedstate.ActiveSyncPurpose,
+			Reads: []relaxedstate.Read{
+				{Namespace: "grandmarket", Key: "quote:BTC-USD", Value: value},
+			},
+		}
+		endorser, err := proto.Marshal(&mspproto.SerializedIdentity{Mspid: mspIDs[index], IdBytes: []byte("certificate")})
+		require.NoError(t, err)
+		encoded, err := json.Marshal(&relaxedstate.SignedEvidence{
+			Payload:   relaxedstate.NewEvidencePayload(simulation, []byte("proposal"), []byte("canonical")),
+			Endorser:  endorser,
+			Signature: []byte("signature"),
+		})
+		require.NoError(t, err)
+		evidence = append(evidence, encoded)
+	}
+
+	result, err := protoutil.ComputeGrandActiveSyncResult(evidence)
+	require.NoError(t, err)
+	require.Equal(t, "grandmarket", result.Namespace)
+	require.Equal(t, "quote:BTC-USD", result.Key)
+	require.Equal(t, protoutil.GrandMedianJSONPriceAlgorithm, result.Algorithm)
+	require.Equal(t, []string{"Org1MSP", "Org2MSP", "Org3MSP"}, result.MSPIDs)
+	require.JSONEq(t, `{"symbol":"BTC-USD","sourceId":"source-2","price":103}`, string(result.Value))
+	hash := sha256.Sum256(result.Value)
+	require.Equal(t, hash[:], result.ValueHash)
+	require.NoError(t, protoutil.ValidateGrandActiveSyncResult(evidence, result))
+
+	tampered := *result
+	tampered.Value = []byte(`{"symbol":"BTC-USD","sourceId":"source-3","price":105}`)
+	tamperedHash := sha256.Sum256(tampered.Value)
+	tampered.ValueHash = tamperedHash[:]
+	require.ErrorContains(t, protoutil.ValidateGrandActiveSyncResult(evidence, &tampered), "does not match")
+
+	duplicateMSP := append([][]byte(nil), evidence...)
+	duplicate := &relaxedstate.SignedEvidence{}
+	require.NoError(t, json.Unmarshal(duplicateMSP[2], duplicate))
+	duplicate.Endorser = func() []byte {
+		encoded, marshalErr := proto.Marshal(&mspproto.SerializedIdentity{Mspid: "Org1MSP", IdBytes: []byte("other")})
+		require.NoError(t, marshalErr)
+		return encoded
+	}()
+	duplicateMSP[2], err = json.Marshal(duplicate)
+	require.NoError(t, err)
+	_, err = protoutil.ComputeGrandActiveSyncResult(duplicateMSP)
+	require.ErrorContains(t, err, "repeats MSP")
 }
 
 func TestGetProposalHash1(t *testing.T) {

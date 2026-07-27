@@ -23,7 +23,18 @@ import (
 	"github.com/syndtr/goleveldb/leveldb"
 )
 
-const LocalEndorsementDomain = "GRAND_LOCAL_STATE_ENDORSEMENT_V1"
+const (
+	LocalEndorsementDomain   = "GRAND_LOCAL_STATE_ENDORSEMENT_V1"
+	StateUpdatePurpose       = "state-update"
+	ActiveSyncPurpose        = "active-sync"
+	MedianJSONPriceAlgorithm = "median-json-price-v1"
+)
+
+type Read struct {
+	Namespace string `json:"namespace"`
+	Key       string `json:"key"`
+	Value     []byte `json:"value,omitempty"`
+}
 
 type Write struct {
 	Namespace string `json:"namespace"`
@@ -35,7 +46,16 @@ type Write struct {
 type Simulation struct {
 	ChannelID string  `json:"channelId"`
 	TxID      string  `json:"txId"`
-	Writes    []Write `json:"writes"`
+	Purpose   string  `json:"purpose"`
+	Reads     []Read  `json:"reads,omitempty"`
+	Writes    []Write `json:"writes,omitempty"`
+}
+
+type ReadEvidence struct {
+	Namespace string `json:"namespace"`
+	Key       string `json:"key"`
+	Value     []byte `json:"value,omitempty"`
+	ValueHash []byte `json:"valueHash"`
 }
 
 type WriteEvidence struct {
@@ -50,9 +70,11 @@ type EvidencePayload struct {
 	Domain              string          `json:"domain"`
 	ChannelID           string          `json:"channelId"`
 	TxID                string          `json:"txId"`
+	Purpose             string          `json:"purpose"`
 	ProposalHash        []byte          `json:"proposalHash"`
 	CanonicalResultHash []byte          `json:"canonicalResultHash"`
-	Writes              []WriteEvidence `json:"writes"`
+	Reads               []ReadEvidence  `json:"reads,omitempty"`
+	Writes              []WriteEvidence `json:"writes,omitempty"`
 }
 
 type SignedEvidence struct {
@@ -62,12 +84,24 @@ type SignedEvidence struct {
 }
 
 type ValueRecord struct {
-	Namespace   string          `json:"namespace"`
-	Key         string          `json:"key"`
-	Value       []byte          `json:"value"`
-	TxID        string          `json:"txId"`
-	BlockNumber uint64          `json:"blockNumber"`
-	Evidence    *SignedEvidence `json:"evidence"`
+	Namespace   string            `json:"namespace"`
+	Key         string            `json:"key"`
+	Value       []byte            `json:"value"`
+	TxID        string            `json:"txId"`
+	BlockNumber uint64            `json:"blockNumber"`
+	Evidence    *SignedEvidence   `json:"evidence"`
+	ActiveSync  *ActiveSyncResult `json:"activeSync,omitempty"`
+}
+
+// ActiveSyncResult is the certified value carried by an active synchronization
+// transaction. The tx manager independently recomputes it from the signed read
+// evidence before passing it to the local store.
+type ActiveSyncResult struct {
+	Namespace string `json:"namespace"`
+	Key       string `json:"key"`
+	Value     []byte `json:"value"`
+	ValueHash []byte `json:"valueHash"`
+	Algorithm string `json:"algorithm"`
 }
 
 type EvidenceVerifier func(*SignedEvidence) error
@@ -114,8 +148,15 @@ func (d *DB) GetRecord(namespace, key string) (*ValueRecord, error) {
 }
 
 func (d *DB) Stage(simulation *Simulation) error {
-	if simulation == nil || len(simulation.Writes) == 0 {
+	if simulation == nil {
 		return nil
+	}
+	purpose := simulationPurpose(simulation)
+	if len(simulation.Writes) == 0 && purpose != ActiveSyncPurpose {
+		return nil
+	}
+	if purpose == ActiveSyncPurpose && (len(simulation.Reads) != 1 || len(simulation.Writes) != 0) {
+		return fmt.Errorf("active sync requires exactly one relaxed read and no relaxed writes")
 	}
 	if simulation.ChannelID != d.channelID {
 		return fmt.Errorf("relaxed simulation channel %q does not match %q", simulation.ChannelID, d.channelID)
@@ -123,6 +164,8 @@ func (d *DB) Stage(simulation *Simulation) error {
 	if simulation.TxID == "" {
 		return fmt.Errorf("relaxed simulation txID must not be empty")
 	}
+	simulation.Purpose = purpose
+	normalizeReads(simulation.Reads)
 	normalizeWrites(simulation.Writes)
 	encoded, err := json.Marshal(simulation)
 	if err != nil {
@@ -172,7 +215,7 @@ func (d *DB) Pending(txID string) (*Simulation, error) {
 	return simulation, nil
 }
 
-func (d *DB) Validate(txID string, bundle [][]byte) error {
+func (d *DB) Validate(txID string, bundle [][]byte, activeSync *ActiveSyncResult) error {
 	pending, err := d.Pending(txID)
 	if err != nil {
 		return err
@@ -193,6 +236,12 @@ func (d *DB) Validate(txID string, bundle [][]byte) error {
 			evidence.Payload.TxID != txID {
 			return fmt.Errorf("relaxed evidence is not bound to channel %s txid %s", d.channelID, txID)
 		}
+		if evidence.Payload.Purpose != StateUpdatePurpose && evidence.Payload.Purpose != ActiveSyncPurpose {
+			return fmt.Errorf("unsupported relaxed evidence purpose %q", evidence.Payload.Purpose)
+		}
+		if err := validateReadEvidence(evidence.Payload.Reads); err != nil {
+			return err
+		}
 		if err := validateWriteEvidence(evidence.Payload.Writes); err != nil {
 			return err
 		}
@@ -207,6 +256,8 @@ func (d *DB) Validate(txID string, bundle [][]byte) error {
 	}
 
 	if pending == nil {
+		// A peer that did not endorse can still validate the signed observation
+		// bundle and adopt the certified value after the transaction is VALID.
 		return nil
 	}
 	if storedEvidence == nil {
@@ -223,16 +274,51 @@ func (d *DB) Validate(txID string, bundle [][]byte) error {
 	if !writesMatchEvidence(pending.Writes, evidence.Payload.Writes) {
 		return fmt.Errorf("txid %s pending relaxed delta does not match local endorsement", txID)
 	}
+	if !readsMatchEvidence(pending.Reads, evidence.Payload.Reads) ||
+		simulationPurpose(pending) != evidence.Payload.Purpose {
+		return fmt.Errorf("txid %s pending relaxed reads do not match local endorsement", txID)
+	}
+	if evidence.Payload.Purpose == ActiveSyncPurpose {
+		if activeSync == nil {
+			return fmt.Errorf("txid %s active sync evidence has no certified result", txID)
+		}
+		if !activeSyncMatchesRead(activeSync, pending.Reads[0]) {
+			return fmt.Errorf("txid %s active sync result does not match the endorsed key or value hash", txID)
+		}
+	} else if activeSync != nil {
+		return fmt.Errorf("txid %s carries an active sync result for a state-update transaction", txID)
+	}
 	return nil
 }
 
-func (d *DB) Commit(txID string, blockNumber uint64) error {
+func (d *DB) Commit(txID string, blockNumber uint64, activeSync *ActiveSyncResult) error {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
 	pendingBytes, err := d.db.Get(pendingKey(txID))
-	if err != nil || pendingBytes == nil {
+	if err != nil {
 		return err
+	}
+	if pendingBytes == nil {
+		if activeSync == nil {
+			return nil
+		}
+		if !validActiveSyncResult(activeSync) {
+			return fmt.Errorf("txid %s active sync commit has an invalid certified result", txID)
+		}
+		record := &ValueRecord{
+			Namespace:   activeSync.Namespace,
+			Key:         activeSync.Key,
+			Value:       append([]byte(nil), activeSync.Value...),
+			TxID:        txID,
+			BlockNumber: blockNumber,
+			ActiveSync:  cloneActiveSyncResult(activeSync),
+		}
+		recordBytes, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		return d.db.Put(committedKey(activeSync.Namespace, activeSync.Key), recordBytes, true)
 	}
 	evidenceBytes, err := d.db.Get(pendingEvidenceKey(txID))
 	if err != nil || evidenceBytes == nil {
@@ -248,6 +334,25 @@ func (d *DB) Commit(txID string, blockNumber uint64) error {
 	}
 
 	batch := &leveldb.Batch{}
+	if simulationPurpose(pending) == ActiveSyncPurpose {
+		if activeSync == nil {
+			return fmt.Errorf("txid %s active sync commit is missing its certified result", txID)
+		}
+		record := &ValueRecord{
+			Namespace:   activeSync.Namespace,
+			Key:         activeSync.Key,
+			Value:       append([]byte(nil), activeSync.Value...),
+			TxID:        txID,
+			BlockNumber: blockNumber,
+			Evidence:    evidence,
+			ActiveSync:  cloneActiveSyncResult(activeSync),
+		}
+		recordBytes, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		batch.Put(committedKey(activeSync.Namespace, activeSync.Key), recordBytes)
+	}
 	for _, write := range pending.Writes {
 		key := committedKey(write.Namespace, write.Key)
 		if write.Delete {
@@ -282,6 +387,16 @@ func (d *DB) Discard(txID string) error {
 }
 
 func NewEvidencePayload(simulation *Simulation, proposalHash, canonicalResultHash []byte) EvidencePayload {
+	reads := make([]ReadEvidence, 0, len(simulation.Reads))
+	for _, read := range simulation.Reads {
+		hash := sha256.Sum256(read.Value)
+		reads = append(reads, ReadEvidence{
+			Namespace: read.Namespace,
+			Key:       read.Key,
+			Value:     append([]byte(nil), read.Value...),
+			ValueHash: hash[:],
+		})
+	}
 	writes := make([]WriteEvidence, 0, len(simulation.Writes))
 	for _, write := range simulation.Writes {
 		hash := sha256.Sum256(write.Value)
@@ -297,8 +412,10 @@ func NewEvidencePayload(simulation *Simulation, proposalHash, canonicalResultHas
 		Domain:              LocalEndorsementDomain,
 		ChannelID:           simulation.ChannelID,
 		TxID:                simulation.TxID,
+		Purpose:             simulationPurpose(simulation),
 		ProposalHash:        append([]byte(nil), proposalHash...),
 		CanonicalResultHash: append([]byte(nil), canonicalResultHash...),
+		Reads:               reads,
 		Writes:              writes,
 	}
 }
@@ -336,6 +453,38 @@ func normalizeWrites(writes []Write) {
 	})
 }
 
+func normalizeReads(reads []Read) {
+	sort.Slice(reads, func(i, j int) bool {
+		if reads[i].Namespace == reads[j].Namespace {
+			return reads[i].Key < reads[j].Key
+		}
+		return reads[i].Namespace < reads[j].Namespace
+	})
+}
+
+func simulationPurpose(simulation *Simulation) string {
+	if simulation == nil {
+		return ""
+	}
+	if simulation.Purpose != "" {
+		return simulation.Purpose
+	}
+	if len(simulation.Writes) > 0 {
+		return StateUpdatePurpose
+	}
+	return ""
+}
+
+func validateReadEvidence(reads []ReadEvidence) error {
+	for _, read := range reads {
+		hash := sha256.Sum256(read.Value)
+		if !bytes.Equal(hash[:], read.ValueHash) {
+			return fmt.Errorf("relaxed read evidence value hash mismatch for %s/%s", read.Namespace, read.Key)
+		}
+	}
+	return nil
+}
+
 func validateWriteEvidence(writes []WriteEvidence) error {
 	for _, write := range writes {
 		hash := sha256.Sum256(write.Value)
@@ -358,6 +507,48 @@ func writesMatchEvidence(writes []Write, evidence []WriteEvidence) bool {
 		}
 	}
 	return true
+}
+
+func readsMatchEvidence(reads []Read, evidence []ReadEvidence) bool {
+	if len(reads) != len(evidence) {
+		return false
+	}
+	for index, read := range reads {
+		item := evidence[index]
+		if read.Namespace != item.Namespace || read.Key != item.Key ||
+			!bytes.Equal(read.Value, item.Value) {
+			return false
+		}
+	}
+	return true
+}
+
+func activeSyncMatchesRead(result *ActiveSyncResult, read Read) bool {
+	if !validActiveSyncResult(result) || result.Namespace != read.Namespace || result.Key != read.Key {
+		return false
+	}
+	return true
+}
+
+func validActiveSyncResult(result *ActiveSyncResult) bool {
+	if result == nil || result.Algorithm != MedianJSONPriceAlgorithm || result.Namespace == "" || result.Key == "" {
+		return false
+	}
+	hash := sha256.Sum256(result.Value)
+	return bytes.Equal(hash[:], result.ValueHash)
+}
+
+func cloneActiveSyncResult(result *ActiveSyncResult) *ActiveSyncResult {
+	if result == nil {
+		return nil
+	}
+	return &ActiveSyncResult{
+		Namespace: result.Namespace,
+		Key:       result.Key,
+		Value:     append([]byte(nil), result.Value...),
+		ValueHash: append([]byte(nil), result.ValueHash...),
+		Algorithm: result.Algorithm,
+	}
 }
 
 func committedKey(namespace, key string) []byte {

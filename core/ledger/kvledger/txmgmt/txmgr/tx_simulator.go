@@ -305,6 +305,16 @@ func (s *txSimulator) GetTxSimulationResults() (*ledger.TxSimulationResults, err
 // GrandRelaxedStateSimulation returns the peer-specific writes excluded from
 // Fabric's canonical RWSet. The endorser signs this payload separately.
 func (s *txSimulator) GrandRelaxedStateSimulation() *relaxedstate.Simulation {
+	reads := make([]relaxedstate.Read, 0, len(s.relaxedReads))
+	for _, read := range s.relaxedReads {
+		reads = append(reads, read)
+	}
+	sort.Slice(reads, func(i, j int) bool {
+		if reads[i].Namespace == reads[j].Namespace {
+			return reads[i].Key < reads[j].Key
+		}
+		return reads[i].Namespace < reads[j].Namespace
+	})
 	writes := make([]relaxedstate.Write, 0, len(s.relaxedWrites))
 	for _, write := range s.relaxedWrites {
 		writes = append(writes, write)
@@ -318,8 +328,16 @@ func (s *txSimulator) GrandRelaxedStateSimulation() *relaxedstate.Simulation {
 	return &relaxedstate.Simulation{
 		ChannelID: s.txmgr.ledgerid,
 		TxID:      s.txid,
+		Reads:     reads,
 		Writes:    writes,
 	}
+}
+
+// StageGrandRelaxedStateSimulation explicitly stages a read-only active-sync
+// request. Ordinary read-only proposals are deliberately not staged because
+// they may never be submitted as transactions.
+func (s *txSimulator) StageGrandRelaxedStateSimulation(simulation *relaxedstate.Simulation) error {
+	return s.txmgr.relaxedState.Stage(simulation)
 }
 
 // StoreGrandRelaxedStateEvidence persists this peer's individual endorsement

@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
+	mspproto "github.com/hyperledger/fabric-protos-go-apiv2/msp"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	"github.com/pkg/errors"
 	"google.golang.org/protobuf/proto"
@@ -28,7 +29,67 @@ const (
 	// an opaque evidence bundle. Unlike application transient data, validators
 	// intentionally preserve and inspect this reserved entry.
 	GrandRelaxedEvidenceTransientKey = "GRAND_RELAXED_EVIDENCE_V1"
+	// GrandActiveSyncRequestMessage is the byte-identical chaincode response
+	// marker that asks endorsers to certify the relaxed value they read.
+	GrandActiveSyncRequestMessage = "GRAND_ACTIVE_SYNC_MEDIAN_JSON_PRICE_V1"
+	// GrandActiveSyncResultMessagePrefix marks a client-facing result produced
+	// only after the corresponding active-sync transaction has committed.
+	GrandActiveSyncResultMessagePrefix = "GRAND_ACTIVE_SYNC_RESULT_V1:"
+	GrandActiveSyncPurpose             = "active-sync"
+	GrandLocalEndorsementDomain        = "GRAND_LOCAL_STATE_ENDORSEMENT_V1"
+	GrandMedianJSONPriceAlgorithm      = "median-json-price-v1"
+	grandRelaxedEvidenceBundleVersion  = 1
 )
+
+// GrandRelaxedEvidenceBundle is retained in the ordered transaction. Evidence
+// contains peer-local signed observations; ActiveSync contains the deterministic
+// aggregate that validators must recompute before accepting the transaction.
+type GrandRelaxedEvidenceBundle struct {
+	Version    int                    `json:"version"`
+	Evidence   [][]byte               `json:"evidence"`
+	ActiveSync *GrandActiveSyncResult `json:"activeSync,omitempty"`
+}
+
+type GrandActiveSyncResult struct {
+	Namespace string   `json:"namespace"`
+	Key       string   `json:"key"`
+	Value     []byte   `json:"value"`
+	ValueHash []byte   `json:"valueHash"`
+	Algorithm string   `json:"algorithm"`
+	MSPIDs    []string `json:"mspIds"`
+}
+
+type grandRelaxedReadEvidence struct {
+	Namespace string `json:"namespace"`
+	Key       string `json:"key"`
+	Value     []byte `json:"value,omitempty"`
+	ValueHash []byte `json:"valueHash"`
+}
+
+type grandRelaxedWriteEvidence struct {
+	Namespace string `json:"namespace"`
+	Key       string `json:"key"`
+	Value     []byte `json:"value,omitempty"`
+	ValueHash []byte `json:"valueHash"`
+	Delete    bool   `json:"delete,omitempty"`
+}
+
+type grandRelaxedEvidencePayload struct {
+	Domain              string                      `json:"domain"`
+	ChannelID           string                      `json:"channelId"`
+	TxID                string                      `json:"txId"`
+	Purpose             string                      `json:"purpose"`
+	ProposalHash        []byte                      `json:"proposalHash"`
+	CanonicalResultHash []byte                      `json:"canonicalResultHash"`
+	Reads               []grandRelaxedReadEvidence  `json:"reads,omitempty"`
+	Writes              []grandRelaxedWriteEvidence `json:"writes,omitempty"`
+}
+
+type grandSignedRelaxedEvidence struct {
+	Payload   grandRelaxedEvidencePayload `json:"payload"`
+	Endorser  []byte                      `json:"endorser"`
+	Signature []byte                      `json:"signature"`
+}
 
 // GetPayloads gets the underlying payload objects in a TransactionAction
 func GetPayloads(txActions *peer.TransactionAction) (*peer.ChaincodeActionPayload, *peer.ChaincodeAction, error) {
@@ -535,7 +596,18 @@ func proposalPayloadForTxWithGrandEvidence(
 	sort.Slice(evidence, func(i, j int) bool {
 		return bytes.Compare(evidence[i], evidence[j]) < 0
 	})
-	bundle, err := json.Marshal(evidence)
+	evidenceBundle := &GrandRelaxedEvidenceBundle{
+		Version:  grandRelaxedEvidenceBundleVersion,
+		Evidence: evidence,
+	}
+	if grandEvidenceIncludesActiveSync(evidence) {
+		activeSync, err := ComputeGrandActiveSyncResult(evidence)
+		if err != nil {
+			return nil, errors.Wrap(err, "compute GraND active-sync result")
+		}
+		evidenceBundle.ActiveSync = activeSync
+	}
+	bundle, err := json.Marshal(evidenceBundle)
 	if err != nil {
 		return nil, errors.Wrap(err, "encode GraND relaxed evidence bundle")
 	}
@@ -547,9 +619,173 @@ func proposalPayloadForTxWithGrandEvidence(
 	})
 }
 
+func grandEvidenceIncludesActiveSync(evidence [][]byte) bool {
+	for _, encoded := range evidence {
+		item := &grandSignedRelaxedEvidence{}
+		if json.Unmarshal(encoded, item) == nil && item.Payload.Purpose == GrandActiveSyncPurpose {
+			return true
+		}
+	}
+	return false
+}
+
+// ComputeGrandActiveSyncResult deterministically selects the median quote from
+// exactly three distinct peer MSP observations. Signature verification remains
+// a V-stage responsibility because protoutil has no channel MSP manager.
+func ComputeGrandActiveSyncResult(evidence [][]byte) (*GrandActiveSyncResult, error) {
+	if len(evidence) != 3 {
+		return nil, errors.Errorf("median-json-price-v1 requires exactly 3 observations, got %d", len(evidence))
+	}
+
+	type observation struct {
+		price int64
+		value []byte
+		mspID string
+	}
+	observations := make([]observation, 0, len(evidence))
+	mspIDs := make([]string, 0, len(evidence))
+	seenMSPIDs := map[string]struct{}{}
+	var namespace, key, channelID, txID string
+	var proposalHash, canonicalResultHash []byte
+
+	for index, encoded := range evidence {
+		item := &grandSignedRelaxedEvidence{}
+		if err := json.Unmarshal(encoded, item); err != nil {
+			return nil, errors.Wrapf(err, "decode active-sync observation %d", index)
+		}
+		payload := item.Payload
+		if payload.Domain != GrandLocalEndorsementDomain || payload.Purpose != GrandActiveSyncPurpose {
+			return nil, errors.Errorf("observation %d is not GraND active-sync evidence", index)
+		}
+		if payload.ChannelID == "" || payload.TxID == "" || len(payload.ProposalHash) == 0 || len(payload.CanonicalResultHash) == 0 {
+			return nil, errors.Errorf("observation %d is missing transaction binding", index)
+		}
+		if len(payload.Reads) != 1 || len(payload.Writes) != 0 {
+			return nil, errors.Errorf("observation %d must contain exactly one relaxed read and no writes", index)
+		}
+		read := payload.Reads[0]
+		valueHash := sha256.Sum256(read.Value)
+		if !bytes.Equal(valueHash[:], read.ValueHash) {
+			return nil, errors.Errorf("observation %d has an invalid relaxed value hash", index)
+		}
+
+		identity := &mspproto.SerializedIdentity{}
+		if err := proto.Unmarshal(item.Endorser, identity); err != nil {
+			return nil, errors.Wrapf(err, "decode active-sync endorser %d", index)
+		}
+		if identity.Mspid == "" {
+			return nil, errors.Errorf("observation %d has an empty MSP ID", index)
+		}
+		if _, duplicate := seenMSPIDs[identity.Mspid]; duplicate {
+			return nil, errors.Errorf("active-sync evidence repeats MSP %s", identity.Mspid)
+		}
+		seenMSPIDs[identity.Mspid] = struct{}{}
+
+		if index == 0 {
+			namespace, key = read.Namespace, read.Key
+			channelID, txID = payload.ChannelID, payload.TxID
+			proposalHash = append([]byte(nil), payload.ProposalHash...)
+			canonicalResultHash = append([]byte(nil), payload.CanonicalResultHash...)
+		} else if read.Namespace != namespace || read.Key != key ||
+			payload.ChannelID != channelID || payload.TxID != txID ||
+			!bytes.Equal(payload.ProposalHash, proposalHash) ||
+			!bytes.Equal(payload.CanonicalResultHash, canonicalResultHash) {
+			return nil, errors.Errorf("observation %d is not bound to the same key and canonical transaction", index)
+		}
+
+		quote := struct {
+			Price *int64 `json:"price"`
+		}{}
+		if err := json.Unmarshal(read.Value, &quote); err != nil || quote.Price == nil {
+			return nil, errors.Errorf("observation %d is not a JSON quote with an integer price", index)
+		}
+		observations = append(observations, observation{
+			price: *quote.Price,
+			value: append([]byte(nil), read.Value...),
+			mspID: identity.Mspid,
+		})
+		mspIDs = append(mspIDs, identity.Mspid)
+	}
+
+	sort.Slice(observations, func(i, j int) bool {
+		if observations[i].price != observations[j].price {
+			return observations[i].price < observations[j].price
+		}
+		if comparison := bytes.Compare(observations[i].value, observations[j].value); comparison != 0 {
+			return comparison < 0
+		}
+		return observations[i].mspID < observations[j].mspID
+	})
+	sort.Strings(mspIDs)
+	median := observations[1]
+	hash := sha256.Sum256(median.value)
+	return &GrandActiveSyncResult{
+		Namespace: namespace,
+		Key:       key,
+		Value:     median.value,
+		ValueHash: hash[:],
+		Algorithm: GrandMedianJSONPriceAlgorithm,
+		MSPIDs:    mspIDs,
+	}, nil
+}
+
+// ValidateGrandActiveSyncResult recomputes the aggregate and compares every
+// committed field with the client's claimed result.
+func ValidateGrandActiveSyncResult(evidence [][]byte, claimed *GrandActiveSyncResult) error {
+	if claimed == nil {
+		return errors.New("active-sync result is missing")
+	}
+	expected, err := ComputeGrandActiveSyncResult(evidence)
+	if err != nil {
+		return err
+	}
+	if expected.Namespace != claimed.Namespace || expected.Key != claimed.Key ||
+		expected.Algorithm != claimed.Algorithm ||
+		!bytes.Equal(expected.Value, claimed.Value) ||
+		!bytes.Equal(expected.ValueHash, claimed.ValueHash) ||
+		len(expected.MSPIDs) != len(claimed.MSPIDs) {
+		return errors.New("claimed active-sync result does not match the recomputed median")
+	}
+	for index := range expected.MSPIDs {
+		if expected.MSPIDs[index] != claimed.MSPIDs[index] {
+			return errors.New("claimed active-sync MSP set does not match the observations")
+		}
+	}
+	return nil
+}
+
+// GetGrandRelaxedEvidenceBundleFromEnvelope extracts the full GraND bundle.
+// It accepts the original array-only encoding to keep old blocks inspectable.
+func GetGrandRelaxedEvidenceBundleFromEnvelope(txEnvelopeBytes []byte) (*GrandRelaxedEvidenceBundle, error) {
+	bundleBytes, err := grandRelaxedEvidenceBytesFromEnvelope(txEnvelopeBytes)
+	if err != nil || len(bundleBytes) == 0 {
+		return nil, err
+	}
+	bundle := &GrandRelaxedEvidenceBundle{}
+	if err := json.Unmarshal(bundleBytes, bundle); err == nil {
+		if bundle.Version != grandRelaxedEvidenceBundleVersion {
+			return nil, errors.Errorf("unsupported GraND relaxed evidence bundle version %d", bundle.Version)
+		}
+		return bundle, nil
+	}
+	var legacyEvidence [][]byte
+	if err := json.Unmarshal(bundleBytes, &legacyEvidence); err != nil {
+		return nil, errors.Wrap(err, "decode GraND relaxed evidence bundle")
+	}
+	return &GrandRelaxedEvidenceBundle{Version: grandRelaxedEvidenceBundleVersion, Evidence: legacyEvidence}, nil
+}
+
 // GetGrandRelaxedEvidenceFromEnvelope extracts individually signed relaxed
 // evidence entries from an ordered endorser transaction.
 func GetGrandRelaxedEvidenceFromEnvelope(txEnvelopeBytes []byte) ([][]byte, error) {
+	bundle, err := GetGrandRelaxedEvidenceBundleFromEnvelope(txEnvelopeBytes)
+	if err != nil || bundle == nil {
+		return nil, err
+	}
+	return bundle.Evidence, nil
+}
+
+func grandRelaxedEvidenceBytesFromEnvelope(txEnvelopeBytes []byte) ([]byte, error) {
 	envelope, err := GetEnvelopeFromBlock(txEnvelopeBytes)
 	if err != nil {
 		return nil, err
@@ -573,15 +809,76 @@ func GetGrandRelaxedEvidenceFromEnvelope(txEnvelopeBytes []byte) ([][]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	bundle := proposalPayload.TransientMap[GrandRelaxedEvidenceTransientKey]
-	if len(bundle) == 0 {
-		return nil, nil
+	return proposalPayload.TransientMap[GrandRelaxedEvidenceTransientKey], nil
+}
+
+// GetGrandCanonicalEndorsersFromEnvelope returns the canonical endorsement
+// identities so validators can bind each local observation to a peer that also
+// endorsed the byte-identical strong/normal transaction projection.
+func GetGrandCanonicalEndorsersFromEnvelope(txEnvelopeBytes []byte) ([][]byte, error) {
+	envelope, err := GetEnvelopeFromBlock(txEnvelopeBytes)
+	if err != nil {
+		return nil, err
 	}
-	var evidence [][]byte
-	if err := json.Unmarshal(bundle, &evidence); err != nil {
-		return nil, errors.Wrap(err, "decode GraND relaxed evidence bundle")
+	payload, err := UnmarshalPayload(envelope.Payload)
+	if err != nil {
+		return nil, err
 	}
-	return evidence, nil
+	tx, err := UnmarshalTransaction(payload.Data)
+	if err != nil {
+		return nil, err
+	}
+	if len(tx.Actions) != 1 {
+		return nil, errors.Errorf("expected one transaction action, got %d", len(tx.Actions))
+	}
+	action, err := UnmarshalChaincodeActionPayload(tx.Actions[0].Payload)
+	if err != nil {
+		return nil, err
+	}
+	if action.Action == nil {
+		return nil, errors.New("transaction action has no canonical endorsements")
+	}
+	endorsers := make([][]byte, 0, len(action.Action.Endorsements))
+	for _, endorsement := range action.Action.Endorsements {
+		if endorsement != nil {
+			endorsers = append(endorsers, append([]byte(nil), endorsement.Endorser...))
+		}
+	}
+	return endorsers, nil
+}
+
+// GetGrandCanonicalBindingFromEnvelope returns the proposal hash and the hash
+// of the canonical ProposalResponsePayload that every local observation must
+// have signed alongside its peer-specific value.
+func GetGrandCanonicalBindingFromEnvelope(txEnvelopeBytes []byte) ([]byte, []byte, error) {
+	envelope, err := GetEnvelopeFromBlock(txEnvelopeBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	payload, err := UnmarshalPayload(envelope.Payload)
+	if err != nil {
+		return nil, nil, err
+	}
+	tx, err := UnmarshalTransaction(payload.Data)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(tx.Actions) != 1 {
+		return nil, nil, errors.Errorf("expected one transaction action, got %d", len(tx.Actions))
+	}
+	action, err := UnmarshalChaincodeActionPayload(tx.Actions[0].Payload)
+	if err != nil {
+		return nil, nil, err
+	}
+	if action.Action == nil || len(action.Action.ProposalResponsePayload) == 0 {
+		return nil, nil, errors.New("transaction action has no canonical proposal response payload")
+	}
+	proposalResponse, err := UnmarshalProposalResponsePayload(action.Action.ProposalResponsePayload)
+	if err != nil {
+		return nil, nil, err
+	}
+	canonicalHash := sha256.Sum256(action.Action.ProposalResponsePayload)
+	return append([]byte(nil), proposalResponse.ProposalHash...), canonicalHash[:], nil
 }
 
 // GetProposalHash1 gets the proposal hash bytes after sanitizing the

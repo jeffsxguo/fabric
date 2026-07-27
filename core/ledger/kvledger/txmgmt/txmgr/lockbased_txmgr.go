@@ -8,6 +8,7 @@ package txmgr
 
 import (
 	"bytes"
+	"encoding/json"
 	"path/filepath"
 	"sync"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	"github.com/hyperledger/fabric-protos-go-apiv2/ledger/rwset"
 	"github.com/hyperledger/fabric-protos-go-apiv2/ledger/rwset/kvrwset"
+	mspproto "github.com/hyperledger/fabric-protos-go-apiv2/msp"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	"github.com/hyperledger/fabric/common/ledger/snapshot"
 	"github.com/hyperledger/fabric/core/ledger"
@@ -122,6 +124,22 @@ func NewLockBasedTxMgr(initializer *Initializer) (*LockBasedTxMgr, error) {
 			identity, err := mspmgmt.GetManagerForChain(initializer.LedgerID).DeserializeIdentity(evidence.Endorser)
 			if err != nil {
 				return err
+			}
+			if err := identity.Validate(); err != nil {
+				return err
+			}
+			roleBytes, err := proto.Marshal(&mspproto.MSPRole{
+				Role:          mspproto.MSPRole_PEER,
+				MspIdentifier: identity.GetMSPIdentifier(),
+			})
+			if err != nil {
+				return err
+			}
+			if err := identity.SatisfiesPrincipal(&mspproto.MSPPrincipal{
+				PrincipalClassification: mspproto.MSPPrincipal_ROLE,
+				Principal:               roleBytes,
+			}); err != nil {
+				return errors.Wrap(err, "relaxed-state endorser is not a channel peer")
 			}
 			signingBytes, err := evidence.SigningBytes()
 			if err != nil {
@@ -631,9 +649,21 @@ func (txmgr *LockBasedTxMgr) validateRelaxedStateEvidence(block *common.Block) {
 		if err != nil {
 			continue
 		}
-		bundle, err := protoutil.GetGrandRelaxedEvidenceFromEnvelope(transaction)
+		bundle, err := protoutil.GetGrandRelaxedEvidenceBundleFromEnvelope(transaction)
 		if err == nil {
-			err = txmgr.relaxedState.Validate(txID, bundle)
+			var evidence [][]byte
+			var activeSync *relaxedstate.ActiveSyncResult
+			if bundle != nil {
+				evidence = bundle.Evidence
+				err = validateGrandEvidenceEndorsers(transaction, evidence)
+				if err == nil {
+					err = validateGrandActiveSyncBundle(bundle)
+				}
+				activeSync = relaxedActiveSyncResult(bundle.ActiveSync)
+			}
+			if err == nil {
+				err = txmgr.relaxedState.Validate(txID, evidence, activeSync)
+			}
 		}
 		if err != nil {
 			logger.Warningf("invalid GraND relaxed-state evidence: txid=%s error=%s", txID, err)
@@ -659,11 +689,84 @@ func (txmgr *LockBasedTxMgr) commitRelaxedState(block *common.Block) error {
 			}
 			continue
 		}
-		if err := txmgr.relaxedState.Commit(txID, block.Header.Number); err != nil {
+		bundle, err := protoutil.GetGrandRelaxedEvidenceBundleFromEnvelope(transaction)
+		if err != nil {
+			return err
+		}
+		var activeSync *relaxedstate.ActiveSyncResult
+		if bundle != nil {
+			activeSync = relaxedActiveSyncResult(bundle.ActiveSync)
+		}
+		if err := txmgr.relaxedState.Commit(txID, block.Header.Number, activeSync); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func validateGrandEvidenceEndorsers(transaction []byte, evidenceBundle [][]byte) error {
+	if len(evidenceBundle) == 0 {
+		return nil
+	}
+	canonicalEndorsers, err := protoutil.GetGrandCanonicalEndorsersFromEnvelope(transaction)
+	if err != nil {
+		return err
+	}
+	proposalHash, canonicalResultHash, err := protoutil.GetGrandCanonicalBindingFromEnvelope(transaction)
+	if err != nil {
+		return err
+	}
+	endorserSet := map[string]struct{}{}
+	for _, endorser := range canonicalEndorsers {
+		endorserSet[string(endorser)] = struct{}{}
+	}
+	for index, encoded := range evidenceBundle {
+		evidence := &relaxedstate.SignedEvidence{}
+		if err := json.Unmarshal(encoded, evidence); err != nil {
+			return errors.Wrapf(err, "decode relaxed evidence %d", index)
+		}
+		if _, ok := endorserSet[string(evidence.Endorser)]; !ok {
+			return errors.Errorf("relaxed evidence %d is not bound to a canonical endorser", index)
+		}
+		if !bytes.Equal(evidence.Payload.ProposalHash, proposalHash) ||
+			!bytes.Equal(evidence.Payload.CanonicalResultHash, canonicalResultHash) {
+			return errors.Errorf("relaxed evidence %d is not bound to the canonical proposal and result", index)
+		}
+	}
+	return nil
+}
+
+func validateGrandActiveSyncBundle(bundle *protoutil.GrandRelaxedEvidenceBundle) error {
+	hasActiveSyncEvidence := false
+	for index, encoded := range bundle.Evidence {
+		evidence := &relaxedstate.SignedEvidence{}
+		if err := json.Unmarshal(encoded, evidence); err != nil {
+			return errors.Wrapf(err, "decode relaxed evidence %d", index)
+		}
+		if evidence.Payload.Purpose == relaxedstate.ActiveSyncPurpose {
+			hasActiveSyncEvidence = true
+		}
+	}
+	if hasActiveSyncEvidence != (bundle.ActiveSync != nil) {
+		return errors.New("active-sync evidence and certified result must appear together")
+	}
+	if bundle.ActiveSync != nil {
+		return protoutil.ValidateGrandActiveSyncResult(bundle.Evidence, bundle.ActiveSync)
+	}
+	return nil
+}
+
+func relaxedActiveSyncResult(result *protoutil.GrandActiveSyncResult) *relaxedstate.ActiveSyncResult {
+	if result == nil {
+		return nil
+	}
+	return &relaxedstate.ActiveSyncResult{
+		Namespace: result.Namespace,
+		Key:       result.Key,
+		Value:     append([]byte(nil), result.Value...),
+		ValueHash: append([]byte(nil), result.ValueHash...),
+		Algorithm: result.Algorithm,
+	}
 }
 
 // Rollback implements method in interface `txmgmt.TxMgr`
