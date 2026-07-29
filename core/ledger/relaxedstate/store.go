@@ -24,10 +24,11 @@ import (
 )
 
 const (
-	LocalEndorsementDomain   = "GRAND_LOCAL_STATE_ENDORSEMENT_V1"
-	StateUpdatePurpose       = "state-update"
-	ActiveSyncPurpose        = "active-sync"
-	MedianJSONPriceAlgorithm = "median-json-price-v1"
+	LocalEndorsementDomain    = "GRAND_LOCAL_STATE_ENDORSEMENT_V1"
+	StateUpdatePurpose        = "state-update"
+	PassiveObservationPurpose = "passive-observation"
+	ActiveSyncPurpose         = "active-sync"
+	MedianJSONPriceAlgorithm  = "median-json-price-v1"
 )
 
 type Read struct {
@@ -236,7 +237,9 @@ func (d *DB) Validate(txID string, bundle [][]byte, activeSync *ActiveSyncResult
 			evidence.Payload.TxID != txID {
 			return fmt.Errorf("relaxed evidence is not bound to channel %s txid %s", d.channelID, txID)
 		}
-		if evidence.Payload.Purpose != StateUpdatePurpose && evidence.Payload.Purpose != ActiveSyncPurpose {
+		if evidence.Payload.Purpose != StateUpdatePurpose &&
+			evidence.Payload.Purpose != PassiveObservationPurpose &&
+			evidence.Payload.Purpose != ActiveSyncPurpose {
 			return fmt.Errorf("unsupported relaxed evidence purpose %q", evidence.Payload.Purpose)
 		}
 		if err := validateReadEvidence(evidence.Payload.Reads); err != nil {
@@ -471,6 +474,9 @@ func simulationPurpose(simulation *Simulation) string {
 	}
 	if len(simulation.Writes) > 0 {
 		return StateUpdatePurpose
+	}
+	if len(simulation.Reads) > 0 {
+		return PassiveObservationPurpose
 	}
 	return ""
 }

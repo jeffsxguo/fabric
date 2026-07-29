@@ -487,7 +487,12 @@ func (e *Endorser) ProcessProposalSuccessfullyOrError(up *UnpackedProposal) (*pb
 				return nil, errors.Wrap(err, "stage GraND active-sync read")
 			}
 		}
-		if simulation != nil && (len(simulation.Writes) > 0 || activeSync) {
+		// Ordinary read-only relaxed observations are signed as well. They are
+		// needed by a client that detects divergent canonical effects and starts
+		// passive E-stage recovery. Unlike writes and active-sync reads, these
+		// observations are not persisted as pending local state because the
+		// divergent proposal may never be ordered.
+		if simulation != nil && (len(simulation.Reads) > 0 || len(simulation.Writes) > 0) {
 			canonicalHash := sha256.Sum256(mPrpBytes)
 			payload := relaxedstate.NewEvidencePayload(simulation, up.ProposalHash, canonicalHash[:])
 			identity, err := e.Support.Serialize()
@@ -503,8 +508,10 @@ func (e *Endorser) ProcessProposalSuccessfullyOrError(up *UnpackedProposal) (*pb
 			if err != nil {
 				return nil, errors.Wrap(err, "sign local relaxed-state endorsement")
 			}
-			if err := relaxedSimulator.StoreGrandRelaxedStateEvidence(evidence); err != nil {
-				return nil, errors.Wrap(err, "store local relaxed-state endorsement")
+			if len(simulation.Writes) > 0 || activeSync {
+				if err := relaxedSimulator.StoreGrandRelaxedStateEvidence(evidence); err != nil {
+					return nil, errors.Wrap(err, "store local relaxed-state endorsement")
+				}
 			}
 			message, err := relaxedstate.EvidenceMessage(evidence)
 			if err != nil {

@@ -104,6 +104,9 @@ func chaincodeInvokeOrQuery(cmd *cobra.Command, invoke bool, cf *ChaincodeCmdFac
 		cf.BroadcastClient,
 	)
 	if err != nil {
+		if strings.Contains(err.Error(), grandPassiveDivergenceMarker) {
+			return err
+		}
 		return errors.Errorf("%s - proposal response: %v", err, proposalResp)
 	}
 
@@ -545,6 +548,14 @@ func ChaincodeInvokeOrQuery(
 			// assemble a signed transaction (it's an Envelope message)
 			env, err := protoutil.CreateSignedTx(prop, signer, responses...)
 			if err != nil {
+				if divergence := grandPassiveDivergenceSummary(responses); divergence != "" {
+					return proposalResp, errors.Errorf(
+						"could not assemble transaction: %v; %s%s",
+						err,
+						grandPassiveDivergenceMarker,
+						divergence,
+					)
+				}
 				return proposalResp, errors.WithMessage(err, "could not assemble transaction")
 			}
 			envelopeBytes, err := proto.Marshal(env)

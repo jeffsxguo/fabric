@@ -341,7 +341,9 @@ func (s *txSimulator) StageGrandRelaxedStateSimulation(simulation *relaxedstate.
 }
 
 // StoreGrandRelaxedStateEvidence persists this peer's individual endorsement
-// so V-stage validation can match it to the staged local delta.
+// so V-stage validation can match it to a staged local write or active-sync
+// read. Ordinary read-only evidence is returned to the client without being
+// persisted because a divergent passive-recovery proposal may never be ordered.
 func (s *txSimulator) StoreGrandRelaxedStateEvidence(evidence *relaxedstate.SignedEvidence) error {
 	return s.txmgr.relaxedState.StoreEvidence(s.txid, evidence)
 }

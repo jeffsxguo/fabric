@@ -137,6 +137,22 @@ func TestActiveSyncCommitsCertifiedValue(t *testing.T) {
 	require.Equal(t, result, record.ActiveSync)
 }
 
+func TestReadOnlyEvidenceUsesPassiveObservationPurpose(t *testing.T) {
+	simulation := &Simulation{
+		ChannelID: "mychannel",
+		TxID:      "decision1",
+		Reads: []Read{{
+			Namespace: "oracle",
+			Key:       "price:BTC-USD",
+			Value:     []byte("104"),
+		}},
+	}
+	payload := NewEvidencePayload(simulation, []byte("proposal"), []byte("result"))
+	require.Equal(t, PassiveObservationPurpose, payload.Purpose)
+	require.Len(t, payload.Reads, 1)
+	require.Empty(t, payload.Writes)
+}
+
 type errInvalidTestSignature struct{}
 
 func (errInvalidTestSignature) Error() string { return "invalid test signature" }
