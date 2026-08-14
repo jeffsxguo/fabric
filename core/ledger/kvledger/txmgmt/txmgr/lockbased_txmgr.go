@@ -697,8 +697,20 @@ func (txmgr *LockBasedTxMgr) commitRelaxedState(block *common.Block) error {
 		if bundle != nil {
 			activeSync = relaxedActiveSyncResult(bundle.ActiveSync)
 		}
-		if err := txmgr.relaxedState.Commit(txID, block.Header.Number, activeSync); err != nil {
+		requests, err := txmgr.relaxedState.CommitAndCollectPreventiveSyncRequests(
+			txID,
+			block.Header.Number,
+			activeSync,
+		)
+		if err != nil {
 			return err
+		}
+		for _, request := range requests {
+			encoded, err := json.Marshal(request)
+			if err != nil {
+				return err
+			}
+			logger.Infof("GRAND_PREVENTIVE_SYNC_REQUIRED:%s", encoded)
 		}
 	}
 	return nil

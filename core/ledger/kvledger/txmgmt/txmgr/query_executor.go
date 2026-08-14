@@ -74,15 +74,22 @@ func (q *queryExecutor) getState(ns, key string) ([]byte, []byte, error) {
 		return nil, nil, err
 	}
 	if level, explicit := q.txmgr.stateConsistency.Resolve(ns, key); explicit && level == stateconsistency.Relaxed {
-		value, err := q.txmgr.relaxedState.Get(ns, key)
-		if err == nil && q.collectReadset {
+		record, err := q.txmgr.relaxedState.GetRecord(ns, key)
+		if err != nil {
+			return nil, nil, err
+		}
+		if record == nil {
+			return nil, []byte(stateconsistency.Relaxed), nil
+		}
+		if q.collectReadset {
 			q.relaxedReads[ns+"\x00"+key] = relaxedstate.Read{
 				Namespace: ns,
 				Key:       key,
-				Value:     append([]byte(nil), value...),
+				Value:     append([]byte(nil), record.Value...),
+				Tier:      record.Tier,
 			}
 		}
-		return value, []byte(stateconsistency.Relaxed), err
+		return append([]byte(nil), record.Value...), []byte(stateconsistency.Relaxed), nil
 	}
 	versionedValue, err := q.txmgr.db.GetState(ns, key)
 	if err != nil {

@@ -319,6 +319,20 @@ func (s *txSimulator) GrandRelaxedStateSimulation() *relaxedstate.Simulation {
 	for _, write := range s.relaxedWrites {
 		writes = append(writes, write)
 	}
+	propagatedTier := relaxedstate.PropagatedTier(reads)
+	for index := range writes {
+		if writes[index].Delete {
+			continue
+		}
+		writes[index].Tier = propagatedTier
+		if threshold, enabled := s.txmgr.stateConsistency.ResolveTierThreshold(
+			writes[index].Namespace,
+			writes[index].Key,
+		); enabled {
+			writes[index].TierThreshold = threshold
+			writes[index].PreventiveSync = propagatedTier >= threshold
+		}
+	}
 	sort.Slice(writes, func(i, j int) bool {
 		if writes[i].Namespace == writes[j].Namespace {
 			return writes[i].Key < writes[j].Key

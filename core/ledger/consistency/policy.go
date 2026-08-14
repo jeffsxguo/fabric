@@ -35,15 +35,22 @@ type Manifest struct {
 // in a namespace. Exact rules take precedence over prefix rules; the longest
 // matching prefix takes precedence over a namespace rule.
 type Rule struct {
-	Namespace string `yaml:"namespace"`
-	Key       string `yaml:"key,omitempty"`
-	KeyPrefix string `yaml:"keyPrefix,omitempty"`
-	Level     string `yaml:"level"`
+	Namespace     string  `yaml:"namespace"`
+	Key           string  `yaml:"key,omitempty"`
+	KeyPrefix     string  `yaml:"keyPrefix,omitempty"`
+	Level         string  `yaml:"level"`
+	TierThreshold *uint64 `yaml:"tierThreshold,omitempty"`
 }
 
 type prefixRule struct {
-	prefix string
-	level  Level
+	prefix        string
+	policySetting policySetting
+}
+
+type policySetting struct {
+	level         Level
+	tierThreshold uint64
+	hasThreshold  bool
 }
 
 type policyKey struct {
@@ -54,9 +61,9 @@ type policyKey struct {
 // Policy is an immutable, validated state-classification policy.
 type Policy struct {
 	defaultLevel     Level
-	exactRules       map[policyKey]Level
+	exactRules       map[policyKey]policySetting
 	prefixRules      map[string][]prefixRule
-	namespaceRules   map[string]Level
+	namespaceRules   map[string]policySetting
 	manifestHash     string
 	manifestPath     string
 	hasExplicitRules bool
@@ -95,9 +102,9 @@ func LoadPolicy(config *Config) (*Policy, error) {
 func NewPolicy(manifest *Manifest) (*Policy, error) {
 	policy := &Policy{
 		defaultLevel:   Normal,
-		exactRules:     map[policyKey]Level{},
+		exactRules:     map[policyKey]policySetting{},
 		prefixRules:    map[string][]prefixRule{},
-		namespaceRules: map[string]Level{},
+		namespaceRules: map[string]policySetting{},
 	}
 	if manifest == nil {
 		return policy, nil
@@ -134,6 +141,17 @@ func NewPolicy(manifest *Manifest) (*Policy, error) {
 		if rule.Key != "" && rule.KeyPrefix != "" {
 			return nil, fmt.Errorf("rule %d: key and keyPrefix are mutually exclusive", index)
 		}
+		setting := policySetting{level: level}
+		if rule.TierThreshold != nil {
+			if level != Relaxed {
+				return nil, fmt.Errorf("rule %d: tierThreshold is only valid for relaxed state", index)
+			}
+			if *rule.TierThreshold == 0 {
+				return nil, fmt.Errorf("rule %d: tierThreshold must be positive", index)
+			}
+			setting.tierThreshold = *rule.TierThreshold
+			setting.hasThreshold = true
+		}
 
 		switch {
 		case rule.Key != "":
@@ -141,7 +159,7 @@ func NewPolicy(manifest *Manifest) (*Policy, error) {
 			if _, exists := policy.exactRules[key]; exists {
 				return nil, fmt.Errorf("rule %d: duplicate exact rule for namespace %q key %q", index, rule.Namespace, rule.Key)
 			}
-			policy.exactRules[key] = level
+			policy.exactRules[key] = setting
 
 		case rule.KeyPrefix != "":
 			key := policyKey{namespace: rule.Namespace, key: rule.KeyPrefix}
@@ -151,14 +169,14 @@ func NewPolicy(manifest *Manifest) (*Policy, error) {
 			seenPrefixes[key] = struct{}{}
 			policy.prefixRules[rule.Namespace] = append(
 				policy.prefixRules[rule.Namespace],
-				prefixRule{prefix: rule.KeyPrefix, level: level},
+				prefixRule{prefix: rule.KeyPrefix, policySetting: setting},
 			)
 
 		default:
 			if _, exists := policy.namespaceRules[rule.Namespace]; exists {
 				return nil, fmt.Errorf("rule %d: duplicate namespace rule for %q", index, rule.Namespace)
 			}
-			policy.namespaceRules[rule.Namespace] = level
+			policy.namespaceRules[rule.Namespace] = setting
 		}
 	}
 
@@ -179,21 +197,38 @@ func NewPolicy(manifest *Manifest) (*Policy, error) {
 // Resolve returns the level for a public world-state key and whether an
 // explicit rule produced it. An unlabelled key is implicitly normal.
 func (p *Policy) Resolve(namespace, key string) (Level, bool) {
-	if p == nil {
-		return Normal, false
+	setting, explicit := p.resolve(namespace, key)
+	return setting.level, explicit
+}
+
+// ResolveTierThreshold returns the fixed preventive-synchronization threshold
+// selected by the same exact-key/longest-prefix/namespace precedence as
+// Resolve. A false result means that tier-triggered synchronization is disabled
+// for this key.
+func (p *Policy) ResolveTierThreshold(namespace, key string) (uint64, bool) {
+	setting, explicit := p.resolve(namespace, key)
+	if !explicit || setting.level != Relaxed || !setting.hasThreshold {
+		return 0, false
 	}
-	if level, ok := p.exactRules[policyKey{namespace: namespace, key: key}]; ok {
-		return level, true
+	return setting.tierThreshold, true
+}
+
+func (p *Policy) resolve(namespace, key string) (policySetting, bool) {
+	if p == nil {
+		return policySetting{level: Normal}, false
+	}
+	if setting, ok := p.exactRules[policyKey{namespace: namespace, key: key}]; ok {
+		return setting, true
 	}
 	for _, rule := range p.prefixRules[namespace] {
 		if len(key) >= len(rule.prefix) && key[:len(rule.prefix)] == rule.prefix {
-			return rule.level, true
+			return rule.policySetting, true
 		}
 	}
-	if level, ok := p.namespaceRules[namespace]; ok {
-		return level, true
+	if setting, ok := p.namespaceRules[namespace]; ok {
+		return setting, true
 	}
-	return p.defaultLevel, false
+	return policySetting{level: p.defaultLevel}, false
 }
 
 // ManifestHash is the SHA-256 hash of the raw manifest bytes.

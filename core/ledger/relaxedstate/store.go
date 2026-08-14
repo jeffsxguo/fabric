@@ -16,6 +16,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 
@@ -35,13 +36,17 @@ type Read struct {
 	Namespace string `json:"namespace"`
 	Key       string `json:"key"`
 	Value     []byte `json:"value,omitempty"`
+	Tier      uint64 `json:"tier,omitempty"`
 }
 
 type Write struct {
-	Namespace string `json:"namespace"`
-	Key       string `json:"key"`
-	Value     []byte `json:"value,omitempty"`
-	Delete    bool   `json:"delete,omitempty"`
+	Namespace      string `json:"namespace"`
+	Key            string `json:"key"`
+	Value          []byte `json:"value,omitempty"`
+	Delete         bool   `json:"delete,omitempty"`
+	Tier           uint64 `json:"tier,omitempty"`
+	TierThreshold  uint64 `json:"tierThreshold,omitempty"`
+	PreventiveSync bool   `json:"preventiveSync,omitempty"`
 }
 
 type Simulation struct {
@@ -57,14 +62,18 @@ type ReadEvidence struct {
 	Key       string `json:"key"`
 	Value     []byte `json:"value,omitempty"`
 	ValueHash []byte `json:"valueHash"`
+	Tier      uint64 `json:"tier,omitempty"`
 }
 
 type WriteEvidence struct {
-	Namespace string `json:"namespace"`
-	Key       string `json:"key"`
-	Value     []byte `json:"value,omitempty"`
-	ValueHash []byte `json:"valueHash"`
-	Delete    bool   `json:"delete,omitempty"`
+	Namespace      string `json:"namespace"`
+	Key            string `json:"key"`
+	Value          []byte `json:"value,omitempty"`
+	ValueHash      []byte `json:"valueHash"`
+	Delete         bool   `json:"delete,omitempty"`
+	Tier           uint64 `json:"tier,omitempty"`
+	TierThreshold  uint64 `json:"tierThreshold,omitempty"`
+	PreventiveSync bool   `json:"preventiveSync,omitempty"`
 }
 
 type EvidencePayload struct {
@@ -85,13 +94,29 @@ type SignedEvidence struct {
 }
 
 type ValueRecord struct {
-	Namespace   string            `json:"namespace"`
-	Key         string            `json:"key"`
-	Value       []byte            `json:"value"`
-	TxID        string            `json:"txId"`
-	BlockNumber uint64            `json:"blockNumber"`
-	Evidence    *SignedEvidence   `json:"evidence"`
-	ActiveSync  *ActiveSyncResult `json:"activeSync,omitempty"`
+	Namespace     string            `json:"namespace"`
+	Key           string            `json:"key"`
+	Value         []byte            `json:"value"`
+	Tier          uint64            `json:"tier"`
+	TierThreshold uint64            `json:"tierThreshold,omitempty"`
+	TxID          string            `json:"txId"`
+	BlockNumber   uint64            `json:"blockNumber"`
+	Evidence      *SignedEvidence   `json:"evidence"`
+	ActiveSync    *ActiveSyncResult `json:"activeSync,omitempty"`
+}
+
+// PreventiveSyncRequest is persisted only after a VALID relaxed write reaches
+// its fixed policy threshold. An external controller can safely retry the
+// existing certified active-sync primitive until that synchronization commits;
+// the active-sync commit then removes this request and resets the value tier.
+type PreventiveSyncRequest struct {
+	ChannelID   string `json:"channelId"`
+	Namespace   string `json:"namespace"`
+	Key         string `json:"key"`
+	Tier        uint64 `json:"tier"`
+	Threshold   uint64 `json:"threshold"`
+	TxID        string `json:"txId"`
+	BlockNumber uint64 `json:"blockNumber"`
 }
 
 // ActiveSyncResult is the certified value carried by an active synchronization
@@ -146,6 +171,20 @@ func (d *DB) GetRecord(namespace, key string) (*ValueRecord, error) {
 		return nil, fmt.Errorf("decode relaxed state record %s/%s: %w", namespace, key, err)
 	}
 	return record, nil
+}
+
+// GetPreventiveSyncRequest returns the durable threshold trigger for one
+// relaxed key, or nil when no synchronization is pending.
+func (d *DB) GetPreventiveSyncRequest(namespace, key string) (*PreventiveSyncRequest, error) {
+	encoded, err := d.db.Get(preventiveSyncKey(namespace, key))
+	if err != nil || encoded == nil {
+		return nil, err
+	}
+	request := &PreventiveSyncRequest{}
+	if err := json.Unmarshal(encoded, request); err != nil {
+		return nil, fmt.Errorf("decode preventive sync request %s/%s: %w", namespace, key, err)
+	}
+	return request, nil
 }
 
 func (d *DB) Stage(simulation *Simulation) error {
@@ -295,91 +334,148 @@ func (d *DB) Validate(txID string, bundle [][]byte, activeSync *ActiveSyncResult
 }
 
 func (d *DB) Commit(txID string, blockNumber uint64, activeSync *ActiveSyncResult) error {
+	_, err := d.CommitAndCollectPreventiveSyncRequests(txID, blockNumber, activeSync)
+	return err
+}
+
+// CommitAndCollectPreventiveSyncRequests applies the peer-local part of a VALID
+// transaction and returns each fixed-threshold trigger created by that commit.
+// The requests are stored in the same LevelDB batch as their relaxed values, so
+// a controller can retry synchronization after a restart without losing the
+// trigger.
+func (d *DB) CommitAndCollectPreventiveSyncRequests(
+	txID string,
+	blockNumber uint64,
+	activeSync *ActiveSyncResult,
+) ([]PreventiveSyncRequest, error) {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
 	pendingBytes, err := d.db.Get(pendingKey(txID))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if pendingBytes == nil {
 		if activeSync == nil {
-			return nil
+			return nil, nil
 		}
 		if !validActiveSyncResult(activeSync) {
-			return fmt.Errorf("txid %s active sync commit has an invalid certified result", txID)
+			return nil, fmt.Errorf("txid %s active sync commit has an invalid certified result", txID)
+		}
+		threshold, err := d.currentTierThreshold(activeSync.Namespace, activeSync.Key)
+		if err != nil {
+			return nil, err
 		}
 		record := &ValueRecord{
-			Namespace:   activeSync.Namespace,
-			Key:         activeSync.Key,
-			Value:       append([]byte(nil), activeSync.Value...),
-			TxID:        txID,
-			BlockNumber: blockNumber,
-			ActiveSync:  cloneActiveSyncResult(activeSync),
+			Namespace:     activeSync.Namespace,
+			Key:           activeSync.Key,
+			Value:         append([]byte(nil), activeSync.Value...),
+			Tier:          0,
+			TierThreshold: threshold,
+			TxID:          txID,
+			BlockNumber:   blockNumber,
+			ActiveSync:    cloneActiveSyncResult(activeSync),
 		}
 		recordBytes, err := json.Marshal(record)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		return d.db.Put(committedKey(activeSync.Namespace, activeSync.Key), recordBytes, true)
+		batch := &leveldb.Batch{}
+		batch.Put(committedKey(activeSync.Namespace, activeSync.Key), recordBytes)
+		batch.Delete(preventiveSyncKey(activeSync.Namespace, activeSync.Key))
+		return nil, d.db.WriteBatch(batch, true)
 	}
 	evidenceBytes, err := d.db.Get(pendingEvidenceKey(txID))
 	if err != nil || evidenceBytes == nil {
-		return err
+		return nil, err
 	}
 	pending := &Simulation{}
 	if err := json.Unmarshal(pendingBytes, pending); err != nil {
-		return err
+		return nil, err
 	}
 	evidence := &SignedEvidence{}
 	if err := json.Unmarshal(evidenceBytes, evidence); err != nil {
-		return err
+		return nil, err
 	}
 
 	batch := &leveldb.Batch{}
 	if simulationPurpose(pending) == ActiveSyncPurpose {
 		if activeSync == nil {
-			return fmt.Errorf("txid %s active sync commit is missing its certified result", txID)
+			return nil, fmt.Errorf("txid %s active sync commit is missing its certified result", txID)
+		}
+		threshold, err := d.currentTierThreshold(activeSync.Namespace, activeSync.Key)
+		if err != nil {
+			return nil, err
 		}
 		record := &ValueRecord{
-			Namespace:   activeSync.Namespace,
-			Key:         activeSync.Key,
-			Value:       append([]byte(nil), activeSync.Value...),
-			TxID:        txID,
-			BlockNumber: blockNumber,
-			Evidence:    evidence,
-			ActiveSync:  cloneActiveSyncResult(activeSync),
+			Namespace:     activeSync.Namespace,
+			Key:           activeSync.Key,
+			Value:         append([]byte(nil), activeSync.Value...),
+			Tier:          0,
+			TierThreshold: threshold,
+			TxID:          txID,
+			BlockNumber:   blockNumber,
+			Evidence:      evidence,
+			ActiveSync:    cloneActiveSyncResult(activeSync),
 		}
 		recordBytes, err := json.Marshal(record)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		batch.Put(committedKey(activeSync.Namespace, activeSync.Key), recordBytes)
+		batch.Delete(preventiveSyncKey(activeSync.Namespace, activeSync.Key))
 	}
+	requests := []PreventiveSyncRequest{}
 	for _, write := range pending.Writes {
 		key := committedKey(write.Namespace, write.Key)
+		requestKey := preventiveSyncKey(write.Namespace, write.Key)
 		if write.Delete {
 			batch.Delete(key)
+			batch.Delete(requestKey)
 			continue
 		}
 		record := &ValueRecord{
-			Namespace:   write.Namespace,
-			Key:         write.Key,
-			Value:       append([]byte(nil), write.Value...),
-			TxID:        txID,
-			BlockNumber: blockNumber,
-			Evidence:    evidence,
+			Namespace:     write.Namespace,
+			Key:           write.Key,
+			Value:         append([]byte(nil), write.Value...),
+			Tier:          write.Tier,
+			TierThreshold: write.TierThreshold,
+			TxID:          txID,
+			BlockNumber:   blockNumber,
+			Evidence:      evidence,
 		}
 		recordBytes, err := json.Marshal(record)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		batch.Put(key, recordBytes)
+		if write.PreventiveSync {
+			request := PreventiveSyncRequest{
+				ChannelID:   d.channelID,
+				Namespace:   write.Namespace,
+				Key:         write.Key,
+				Tier:        write.Tier,
+				Threshold:   write.TierThreshold,
+				TxID:        txID,
+				BlockNumber: blockNumber,
+			}
+			requestBytes, err := json.Marshal(request)
+			if err != nil {
+				return nil, err
+			}
+			batch.Put(requestKey, requestBytes)
+			requests = append(requests, request)
+		} else {
+			batch.Delete(requestKey)
+		}
 	}
 	batch.Put(committedEvidenceKey(txID), evidenceBytes)
 	batch.Delete(pendingKey(txID))
 	batch.Delete(pendingEvidenceKey(txID))
-	return d.db.WriteBatch(batch, true)
+	if err := d.db.WriteBatch(batch, true); err != nil {
+		return nil, err
+	}
+	return requests, nil
 }
 
 func (d *DB) Discard(txID string) error {
@@ -398,17 +494,21 @@ func NewEvidencePayload(simulation *Simulation, proposalHash, canonicalResultHas
 			Key:       read.Key,
 			Value:     append([]byte(nil), read.Value...),
 			ValueHash: hash[:],
+			Tier:      read.Tier,
 		})
 	}
 	writes := make([]WriteEvidence, 0, len(simulation.Writes))
 	for _, write := range simulation.Writes {
 		hash := sha256.Sum256(write.Value)
 		writes = append(writes, WriteEvidence{
-			Namespace: write.Namespace,
-			Key:       write.Key,
-			Value:     append([]byte(nil), write.Value...),
-			ValueHash: hash[:],
-			Delete:    write.Delete,
+			Namespace:      write.Namespace,
+			Key:            write.Key,
+			Value:          append([]byte(nil), write.Value...),
+			ValueHash:      hash[:],
+			Delete:         write.Delete,
+			Tier:           write.Tier,
+			TierThreshold:  write.TierThreshold,
+			PreventiveSync: write.PreventiveSync,
 		})
 	}
 	return EvidencePayload{
@@ -421,6 +521,28 @@ func NewEvidencePayload(simulation *Simulation, proposalHash, canonicalResultHas
 		Reads:               reads,
 		Writes:              writes,
 	}
+}
+
+// PropagatedTier implements the first online tier rule: a transaction with at
+// least one relaxed input advances the maximum input tier by one; an external
+// or canonical-only write starts a new relaxed baseline at tier zero. Multiple
+// reads conservatively taint every relaxed output with their maximum tier. A
+// future tauPlan integration can replace this transaction-level offset without
+// changing the persisted tier/evidence format.
+func PropagatedTier(reads []Read) uint64 {
+	if len(reads) == 0 {
+		return 0
+	}
+	maximum := reads[0].Tier
+	for _, read := range reads[1:] {
+		if read.Tier > maximum {
+			maximum = read.Tier
+		}
+	}
+	if maximum == math.MaxUint64 {
+		return maximum
+	}
+	return maximum + 1
 }
 
 func (e *SignedEvidence) PayloadBytes() ([]byte, error) {
@@ -497,6 +619,16 @@ func validateWriteEvidence(writes []WriteEvidence) error {
 		if !bytes.Equal(hash[:], write.ValueHash) {
 			return fmt.Errorf("relaxed evidence value hash mismatch for %s/%s", write.Namespace, write.Key)
 		}
+		expectedTrigger := !write.Delete && write.TierThreshold > 0 && write.Tier >= write.TierThreshold
+		if write.PreventiveSync != expectedTrigger {
+			return fmt.Errorf(
+				"relaxed evidence has inconsistent preventive-sync trigger for %s/%s: tier=%d threshold=%d",
+				write.Namespace,
+				write.Key,
+				write.Tier,
+				write.TierThreshold,
+			)
+		}
 	}
 	return nil
 }
@@ -508,7 +640,9 @@ func writesMatchEvidence(writes []Write, evidence []WriteEvidence) bool {
 	for index, write := range writes {
 		item := evidence[index]
 		if write.Namespace != item.Namespace || write.Key != item.Key ||
-			write.Delete != item.Delete || !bytes.Equal(write.Value, item.Value) {
+			write.Delete != item.Delete || write.Tier != item.Tier ||
+			write.TierThreshold != item.TierThreshold || write.PreventiveSync != item.PreventiveSync ||
+			!bytes.Equal(write.Value, item.Value) {
 			return false
 		}
 	}
@@ -522,7 +656,7 @@ func readsMatchEvidence(reads []Read, evidence []ReadEvidence) bool {
 	for index, read := range reads {
 		item := evidence[index]
 		if read.Namespace != item.Namespace || read.Key != item.Key ||
-			!bytes.Equal(read.Value, item.Value) {
+			read.Tier != item.Tier || !bytes.Equal(read.Value, item.Value) {
 			return false
 		}
 	}
@@ -557,6 +691,18 @@ func cloneActiveSyncResult(result *ActiveSyncResult) *ActiveSyncResult {
 	}
 }
 
+func (d *DB) currentTierThreshold(namespace, key string) (uint64, error) {
+	recordBytes, err := d.db.Get(committedKey(namespace, key))
+	if err != nil || recordBytes == nil {
+		return 0, err
+	}
+	record := &ValueRecord{}
+	if err := json.Unmarshal(recordBytes, record); err != nil {
+		return 0, fmt.Errorf("decode relaxed state %s/%s: %w", namespace, key, err)
+	}
+	return record.TierThreshold, nil
+}
+
 func committedKey(namespace, key string) []byte {
 	return []byte("c|" + encodeKey(namespace) + "|" + encodeKey(key))
 }
@@ -571,6 +717,10 @@ func pendingEvidenceKey(txID string) []byte {
 
 func committedEvidenceKey(txID string) []byte {
 	return []byte("e|" + encodeKey(txID))
+}
+
+func preventiveSyncKey(namespace, key string) []byte {
+	return []byte("r|" + encodeKey(namespace) + "|" + encodeKey(key))
 }
 
 func encodeKey(value string) string {

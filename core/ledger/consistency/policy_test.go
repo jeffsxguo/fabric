@@ -57,8 +57,8 @@ func TestPolicyPrecedence(t *testing.T) {
 		Rules: []Rule{
 			{Namespace: "basic", Level: "strong"},
 			{Namespace: "basic", KeyPrefix: "asset", Level: "normal"},
-			{Namespace: "basic", KeyPrefix: "asset-private", Level: "relaxed"},
-			{Namespace: "basic", Key: "asset1", Level: "relaxed"},
+			{Namespace: "basic", KeyPrefix: "asset-private", Level: "relaxed", TierThreshold: uint64Pointer(7)},
+			{Namespace: "basic", Key: "asset1", Level: "relaxed", TierThreshold: uint64Pointer(3)},
 		},
 	})
 	require.NoError(t, err)
@@ -81,6 +81,15 @@ func TestPolicyPrecedence(t *testing.T) {
 		require.Equal(t, test.level, level)
 		require.Equal(t, test.explicit, explicit)
 	}
+
+	threshold, enabled := policy.ResolveTierThreshold("basic", "asset1")
+	require.Equal(t, uint64(3), threshold)
+	require.True(t, enabled)
+	threshold, enabled = policy.ResolveTierThreshold("basic", "asset-private-1")
+	require.Equal(t, uint64(7), threshold)
+	require.True(t, enabled)
+	_, enabled = policy.ResolveTierThreshold("basic", "asset2")
+	require.False(t, enabled)
 }
 
 func TestLoadPolicy(t *testing.T) {
@@ -92,6 +101,7 @@ rules:
   - namespace: basic
     keyPrefix: "relaxed:"
     level: relaxed
+    tierThreshold: 5
 `), 0o600))
 
 	policy, err := LoadPolicy(&Config{ManifestPath: path})
@@ -101,6 +111,9 @@ rules:
 	level, explicit := policy.Resolve("basic", "relaxed:oracle")
 	require.Equal(t, Relaxed, level)
 	require.True(t, explicit)
+	threshold, enabled := policy.ResolveTierThreshold("basic", "relaxed:oracle")
+	require.Equal(t, uint64(5), threshold)
+	require.True(t, enabled)
 }
 
 func TestLoadPolicyRejectsUnknownFields(t *testing.T) {
@@ -146,6 +159,20 @@ func TestInvalidPolicies(t *testing.T) {
 			}},
 			error: "duplicate namespace rule",
 		},
+		{
+			name: "threshold on canonical state",
+			manifest: &Manifest{Version: 1, Rules: []Rule{
+				{Namespace: "basic", Level: "strong", TierThreshold: uint64Pointer(2)},
+			}},
+			error: "tierThreshold is only valid for relaxed state",
+		},
+		{
+			name: "zero threshold",
+			manifest: &Manifest{Version: 1, Rules: []Rule{
+				{Namespace: "basic", Level: "relaxed", TierThreshold: uint64Pointer(0)},
+			}},
+			error: "tierThreshold must be positive",
+		},
 	}
 
 	for _, test := range tests {
@@ -154,4 +181,8 @@ func TestInvalidPolicies(t *testing.T) {
 			require.ErrorContains(t, err, test.error)
 		})
 	}
+}
+
+func uint64Pointer(value uint64) *uint64 {
+	return &value
 }

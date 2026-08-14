@@ -21,6 +21,9 @@ rules:
   - namespace: basic
     keyPrefix: "relaxed:"
     level: relaxed
+    # Optional fixed preventive-sync threshold. Omit it to disable tier-based
+    # synchronization for the matching relaxed state.
+    tierThreshold: 3
 
   # An exact-key rule overrides both prefix and namespace rules.
   - namespace: basic

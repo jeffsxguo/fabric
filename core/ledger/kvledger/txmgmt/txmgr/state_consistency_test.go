@@ -11,6 +11,7 @@ import (
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
+	"github.com/hyperledger/fabric/core/ledger/relaxedstate"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -98,6 +99,58 @@ func TestTxSimulatorAssignsStateConsistencyLevels(t *testing.T) {
 	implicitMetadata, err := query.GetStateMetadata("unconfigured", "key")
 	require.NoError(t, err)
 	require.NotContains(t, implicitMetadata, stateconsistency.MetadataKey)
+}
+
+func TestTxSimulatorPropagatesTierAndMarksFixedThreshold(t *testing.T) {
+	env := testEnvsMap[levelDBtestEnvName]
+	env.init(t, "relaxed-tier-threshold", nil)
+	defer env.cleanup()
+
+	threshold := uint64(4)
+	policy, err := stateconsistency.NewPolicy(&stateconsistency.Manifest{
+		Version: 1,
+		Rules: []stateconsistency.Rule{
+			{Namespace: "source", KeyPrefix: "quote:", Level: "relaxed"},
+			{Namespace: "derived", KeyPrefix: "quote:", Level: "relaxed", TierThreshold: &threshold},
+		},
+	})
+	require.NoError(t, err)
+	txMgr := env.getTxMgr()
+	txMgr.stateConsistency = policy
+
+	seed := &relaxedstate.Simulation{
+		ChannelID: txMgr.ledgerid,
+		TxID:      "seed-tier",
+		Writes: []relaxedstate.Write{{
+			Namespace: "source",
+			Key:       "quote:BTC-USD",
+			Value:     []byte("103"),
+			Tier:      3,
+		}},
+	}
+	require.NoError(t, txMgr.relaxedState.Stage(seed))
+	require.NoError(t, txMgr.relaxedState.StoreEvidence(seed.TxID, &relaxedstate.SignedEvidence{
+		Payload:   relaxedstate.NewEvidencePayload(seed, nil, nil),
+		Endorser:  []byte("test-peer"),
+		Signature: []byte("test-signature"),
+	}))
+	require.NoError(t, txMgr.relaxedState.Commit(seed.TxID, 1, nil))
+
+	simulator, err := txMgr.NewTxSimulator("propagate-tier")
+	require.NoError(t, err)
+	value, err := simulator.GetState("source", "quote:BTC-USD")
+	require.NoError(t, err)
+	require.Equal(t, []byte("103"), value)
+	require.NoError(t, simulator.SetState("derived", "quote:BTC-USD", []byte("104")))
+	_, err = simulator.GetTxSimulationResults()
+	require.NoError(t, err)
+	defer simulator.Done()
+
+	localSimulation := simulator.(*txSimulator).GrandRelaxedStateSimulation()
+	require.Equal(t, uint64(3), localSimulation.Reads[0].Tier)
+	require.Equal(t, uint64(4), localSimulation.Writes[0].Tier)
+	require.Equal(t, uint64(4), localSimulation.Writes[0].TierThreshold)
+	require.True(t, localSimulation.Writes[0].PreventiveSync)
 }
 
 func TestTxSimulatorRejectsInvalidStateConsistencyLevel(t *testing.T) {

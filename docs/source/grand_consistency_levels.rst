@@ -55,12 +55,17 @@ must be mounted inside the container at the configured path.
      - namespace: basic
        key: "relaxed:oracle"
        level: relaxed
+       tierThreshold: 3
 
 Rules have deterministic precedence: exact key, longest matching prefix,
 namespace rule, and finally the implicit normal default. Manifest version 1
 requires a normal default so old and unlisted state has one consistent
 classification. Explicit namespace, prefix, and exact-key rules may still
 classify selected public state as strong or relaxed.
+
+``tierThreshold`` is optional and is accepted only on relaxed rules. It must be
+a positive integer. Omitting it disables tier-triggered preventive
+synchronization for states selected by that rule.
 
 Relaxed-state execution
 -----------------------
@@ -82,10 +87,20 @@ canonical proposal hash, verifies every local MSP signature, and requires its
 own pending delta to match its evidence. A VALID transaction commits the local
 delta; an invalid transaction discards it.
 
+Relaxed values, reads, writes, and signed evidence also carry a propagation
+``tier``. The first online rule assigns tier zero to a relaxed write without a
+relaxed input, and otherwise assigns ``max(input tier) + 1`` to every relaxed
+output of the transaction. If a VALID write reaches its fixed manifest
+threshold, the peer atomically stores a durable preventive-sync request and
+logs ``GRAND_PREVENTIVE_SYNC_REQUIRED``. An external controller can then invoke
+the existing certified active-sync primitive. A VALID active-sync replacement
+clears the request and resets the value tier to zero. Threshold feedback and
+per-path ``tauPlan`` evaluation are not part of this first implementation.
+
 The first implementation supports exact-key ``GetState``,
 ``GetStateMultipleKeys``, ``PutState``, and delete. Range and rich queries do
-not merge the relaxed database. Adaptive synchronization, promotion, repair,
-and a final evidence-root protocol remain future work. In particular,
+not merge the relaxed database. Threshold feedback, promotion, V-stage replay
+repair, and a final evidence-root protocol remain future work. In particular,
 canonical endorsements do not yet bind the final evidence bundle, so this is
 an experimental one-phase vertical slice rather than the final protocol.
 
