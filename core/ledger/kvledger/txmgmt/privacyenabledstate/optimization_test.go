@@ -69,7 +69,7 @@ func TestMetadataHintOptimizationSkippingGoingToDB(t *testing.T) {
 	mockVersionedDB := &mock.VersionedDB{}
 	metadatahint, err := newMetadataHint(bookkeeper)
 	require.NoError(t, err)
-	db, err := NewDB(mockVersionedDB, "testledger", metadatahint)
+	db, err := NewDB(mockVersionedDB, "testledger", metadatahint, nil)
 	require.NoError(t, err)
 	updates := NewUpdateBatch()
 	updates.PubUpdates.PutValAndMetadata("ns1", "key", []byte("value"), []byte("metadata"), version.NewHeight(1, 1))

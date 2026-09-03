@@ -87,3 +87,29 @@ func TestMetadata(t *testing.T) {
 	require.Nil(t, err)
 	require.Equal(t, count, 2)
 }
+
+func TestGraNDContractProgramMetadata(t *testing.T) {
+	analysis := []byte(`{
+		"schemaVersion": 1,
+		"levelEncoding": "signed-integer-v1",
+		"initialLevel": 0,
+		"changeFunction": "identity",
+		"relaxedTierThreshold": 10
+	}`)
+	codePackage := getCodePackage([]byte("cc code"), []tarEntry{{
+		name:    "META-INF/grand/consistency.json",
+		content: analysis,
+	}})
+	metadata, err := MetadataAsTarEntries(codePackage)
+	require.NoError(t, err)
+	count, err := getNumEntries(metadata)
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+
+	invalidPackage := getCodePackage([]byte("cc code"), []tarEntry{{
+		name:    "META-INF/grand/consistency.json",
+		content: []byte(`{"schemaVersion":1}`),
+	}})
+	_, err = MetadataAsTarEntries(invalidPackage)
+	require.ErrorContains(t, err, "level encoding")
+}

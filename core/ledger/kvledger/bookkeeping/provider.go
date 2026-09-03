@@ -22,6 +22,9 @@ const (
 	MetadataPresenceIndicator
 	// SnapshotRequest maintains the information for snapshot requests
 	SnapshotRequest
+	// ContractConsistency stores lifecycle-deployed GraND consistency
+	// transition programs for the chaincodes on a channel.
+	ContractConsistency
 )
 
 // Provider provides db handle to different bookkeepers
@@ -50,7 +53,7 @@ func (p *Provider) Close() {
 
 // Drop drops channel-specific data from the config history db
 func (p *Provider) Drop(ledgerID string) error {
-	for _, cat := range []Category{PvtdataExpiry, MetadataPresenceIndicator, SnapshotRequest} {
+	for _, cat := range []Category{PvtdataExpiry, MetadataPresenceIndicator, SnapshotRequest, ContractConsistency} {
 		if err := p.dbProvider.Drop(dbName(ledgerID, cat)); err != nil {
 			return err
 		}

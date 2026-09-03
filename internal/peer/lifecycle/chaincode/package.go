@@ -11,10 +11,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/hyperledger/fabric/core/chaincode/persistence"
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	"github.com/hyperledger/fabric/internal/peer/packaging"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -43,6 +46,9 @@ type PackageInput struct {
 	Path       string
 	Type       string
 	Label      string
+	// GrandConsistencyFile is an optional offline analysis result embedded at
+	// META-INF/grand/consistency.json inside code.tar.gz.
+	GrandConsistencyFile string
 }
 
 // Validate checks for the required inputs
@@ -91,6 +97,7 @@ func PackageCmd(p *Packager) *cobra.Command {
 		"label",
 		"lang",
 		"path",
+		"grand-consistency",
 		"peerAddresses",
 		"tlsRootCertFiles",
 		"connectionProfile",
@@ -117,10 +124,11 @@ func (p *Packager) PackageChaincode(args []string) error {
 
 func (p *Packager) setInput(outputFile string) {
 	p.Input = &PackageInput{
-		OutputFile: outputFile,
-		Path:       chaincodePath,
-		Type:       chaincodeLang,
-		Label:      packageLabel,
+		OutputFile:           outputFile,
+		Path:                 chaincodePath,
+		Type:                 chaincodeLang,
+		Label:                packageLabel,
+		GrandConsistencyFile: grandConsistencyFile,
 	}
 }
 
@@ -175,6 +183,19 @@ func (p *Packager) getTarGzBytes() ([]byte, error) {
 	if err != nil {
 		return nil, errors.WithMessage(err, "error getting chaincode bytes")
 	}
+	if p.Input.GrandConsistencyFile != "" {
+		analysis, err := os.ReadFile(p.Input.GrandConsistencyFile)
+		if err != nil {
+			return nil, errors.Wrap(err, "read GraND consistency analysis result")
+		}
+		if _, err := stateconsistency.ParseContractProgram(analysis); err != nil {
+			return nil, errors.Wrap(err, "validate GraND consistency analysis result")
+		}
+		codeBytes, err = addGraNDConsistencyArtifact(codeBytes, analysis)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	codePackageName := "code.tar.gz"
 
@@ -192,6 +213,50 @@ func (p *Packager) getTarGzBytes() ([]byte, error) {
 	}
 
 	return payload.Bytes(), nil
+}
+
+func addGraNDConsistencyArtifact(codePackage, analysis []byte) ([]byte, error) {
+	reader, err := gzip.NewReader(bytes.NewReader(codePackage))
+	if err != nil {
+		return nil, errors.Wrap(err, "open chaincode code package for GraND metadata")
+	}
+	defer reader.Close()
+
+	result := bytes.NewBuffer(nil)
+	gzipWriter := gzip.NewWriter(result)
+	tarWriter := tar.NewWriter(gzipWriter)
+	tarReader := tar.NewReader(reader)
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "read chaincode code package for GraND metadata")
+		}
+		if header.Name == stateconsistency.ContractProgramArtifact {
+			return nil, errors.Errorf(
+				"chaincode code package already contains %s; do not also use --grand-consistency",
+				stateconsistency.ContractProgramArtifact,
+			)
+		}
+		if err := tarWriter.WriteHeader(header); err != nil {
+			return nil, errors.Wrap(err, "copy chaincode code package header")
+		}
+		if _, err := io.Copy(tarWriter, tarReader); err != nil {
+			return nil, errors.Wrap(err, "copy chaincode code package entry")
+		}
+	}
+	if err := writeBytesToPackage(tarWriter, stateconsistency.ContractProgramArtifact, analysis); err != nil {
+		return nil, errors.Wrap(err, "add GraND consistency analysis result")
+	}
+	if err := tarWriter.Close(); err != nil {
+		return nil, errors.Wrap(err, "close chaincode code package tar")
+	}
+	if err := gzipWriter.Close(); err != nil {
+		return nil, errors.Wrap(err, "close chaincode code package gzip stream")
+	}
+	return result.Bytes(), nil
 }
 
 func writeBytesToPackage(tw *tar.Writer, name string, payload []byte) error {

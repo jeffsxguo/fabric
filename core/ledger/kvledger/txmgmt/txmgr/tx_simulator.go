@@ -48,6 +48,9 @@ func (s *txSimulator) SetState(ns string, key string, value []byte) error {
 	if err := s.checkWritePrecondition(key, value); err != nil {
 		return err
 	}
+	if deployedProgram, deployed := s.txmgr.db.ContractConsistencyProgram(ns); deployed {
+		return s.setStateWithContractProgram(ns, key, value, deployedProgram)
+	}
 	if level, explicit := s.txmgr.stateConsistency.Resolve(ns, key); explicit && level == stateconsistency.Relaxed {
 		s.relaxedWrites[ns+"\x00"+key] = relaxedstate.Write{
 			Namespace: ns,
@@ -66,6 +69,79 @@ func (s *txSimulator) SetState(ns string, key string, value []byte) error {
 		return nil
 	}
 	return s.applyStateConsistency(ns, key)
+}
+
+func (s *txSimulator) setStateWithContractProgram(
+	namespace,
+	key string,
+	value []byte,
+	deployed *stateconsistency.DeployedContractProgram,
+) error {
+	// Resolving the destination's existing level is part of the transition
+	// function, even for a blind PutState. Route it through the query executor
+	// so a canonical version participates in MVCC and a relaxed version is
+	// represented in the peer-local evidence.
+	if _, _, err := s.queryExecutor.getState(namespace, key); err != nil {
+		return err
+	}
+
+	if value == nil {
+		if record, err := s.txmgr.relaxedState.GetRecord(namespace, key); err != nil {
+			return err
+		} else if record != nil {
+			s.relaxedWrites[namespace+"\x00"+key] = relaxedstate.Write{
+				Namespace:     namespace,
+				Key:           key,
+				Delete:        true,
+				Tier:          record.Tier,
+				TierThreshold: deployed.Program.RelaxedTierThreshold,
+			}
+			return nil
+		}
+		s.rwsetBuilder.AddToWriteSet(namespace, key, nil)
+		return s.checkStateMetadata(namespace, key)
+	}
+
+	numericLevel, err := deployed.Program.Apply(s.queryExecutor.contractInputLevels(namespace))
+	if err != nil {
+		return err
+	}
+	if numericLevel > stateconsistency.NormalNumericLevel {
+		// A positive level is a relaxed tier. The canonical delete removes an
+		// earlier normal/strong representation if this write performs the first
+		// transition into the peer-local relaxed store.
+		s.rwsetBuilder.AddToWriteSet(namespace, key, nil)
+		if err := s.checkStateMetadata(namespace, key); err != nil {
+			return err
+		}
+		s.relaxedWrites[namespace+"\x00"+key] = relaxedstate.Write{
+			Namespace:     namespace,
+			Key:           key,
+			Value:         append([]byte(nil), value...),
+			Tier:          uint64(numericLevel),
+			TierThreshold: deployed.Program.RelaxedTierThreshold,
+		}
+		return nil
+	}
+
+	s.rwsetBuilder.AddToWriteSet(namespace, key, value)
+	if err := s.checkStateMetadata(namespace, key); err != nil {
+		return err
+	}
+	return s.applyContractConsistency(namespace, key, numericLevel)
+}
+
+func (s *txSimulator) applyContractConsistency(namespace, key string, numericLevel int64) error {
+	metadata, err := s.currentStateMetadata(namespace, key)
+	if err != nil {
+		return err
+	}
+	metadata, err = stateconsistency.WithNumericLevel(metadata, numericLevel)
+	if err != nil {
+		return err
+	}
+	s.rwsetBuilder.AddToMetadataWriteSet(namespace, key, metadata)
+	return nil
 }
 
 func (s *txSimulator) applyStateConsistency(namespace, key string) error {
@@ -144,6 +220,9 @@ func (s *txSimulator) SetStateMetadata(namespace, key string, metadata map[strin
 	if err := s.checkWritePrecondition(key, nil); err != nil {
 		return err
 	}
+	if _, deployed := s.txmgr.db.ContractConsistencyProgram(namespace); deployed {
+		return s.setStateMetadataWithContractProgram(namespace, key, metadata)
+	}
 	if level, explicit := s.txmgr.stateConsistency.Resolve(namespace, key); explicit && level == stateconsistency.Relaxed {
 		for metadataKey := range metadata {
 			if metadataKey != stateconsistency.MetadataKey {
@@ -176,6 +255,49 @@ func (s *txSimulator) SetStateMetadata(namespace, key string, metadata map[strin
 		if err != nil {
 			return err
 		}
+	}
+	s.rwsetBuilder.AddToMetadataWriteSet(namespace, key, metadata)
+	return s.checkStateMetadata(namespace, key)
+}
+
+func (s *txSimulator) setStateMetadataWithContractProgram(namespace, key string, metadata map[string][]byte) error {
+	for metadataKey := range metadata {
+		if metadataKey == stateconsistency.MetadataKey || metadataKey == stateconsistency.NumericMetadataKey {
+			return errors.Errorf(
+				"metadata %q is managed by the deployed GraND consistency program",
+				metadataKey,
+			)
+		}
+	}
+
+	compositeKey := namespace + "\x00" + key
+	_, pendingRelaxedWrite := s.relaxedWrites[compositeKey]
+	relaxedRecord, err := s.txmgr.relaxedState.GetRecord(namespace, key)
+	if err != nil {
+		return err
+	}
+	if pendingRelaxedWrite || relaxedRecord != nil {
+		if len(metadata) != 0 {
+			for metadataKey := range metadata {
+				return errors.Errorf("metadata %q is not supported for peer-local relaxed state", metadataKey)
+			}
+		}
+		// Deleting metadata cannot remove the synthesized consistency level of a
+		// relaxed record, so an empty metadata update is deliberately a no-op.
+		return nil
+	}
+
+	currentMetadata, err := s.currentStateMetadata(namespace, key)
+	if err != nil {
+		return err
+	}
+	numericLevel, err := stateconsistency.NumericLevelFromMetadata(currentMetadata)
+	if err != nil {
+		return err
+	}
+	metadata, err = stateconsistency.WithNumericLevel(metadata, numericLevel)
+	if err != nil {
+		return err
 	}
 	s.rwsetBuilder.AddToMetadataWriteSet(namespace, key, metadata)
 	return s.checkStateMetadata(namespace, key)
@@ -322,6 +444,14 @@ func (s *txSimulator) GrandRelaxedStateSimulation() *relaxedstate.Simulation {
 	propagatedTier := relaxedstate.PropagatedTier(reads)
 	for index := range writes {
 		if writes[index].Delete {
+			continue
+		}
+		if deployed, ok := s.txmgr.db.ContractConsistencyProgram(writes[index].Namespace); ok {
+			// The deployed change function already evaluated this tier while the
+			// write was observed. Keep k for future synchronization work, but do
+			// not trigger threshold synchronization in schema version 1.
+			writes[index].TierThreshold = deployed.Program.RelaxedTierThreshold
+			writes[index].PreventiveSync = false
 			continue
 		}
 		writes[index].Tier = propagatedTier

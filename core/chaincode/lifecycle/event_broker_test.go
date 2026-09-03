@@ -9,6 +9,7 @@ package lifecycle_test
 import (
 	"archive/tar"
 	"bytes"
+	"encoding/json"
 	"io"
 
 	lb "github.com/hyperledger/fabric-protos-go-apiv2/peer/lifecycle"
@@ -17,6 +18,7 @@ import (
 	"github.com/hyperledger/fabric/core/chaincode/persistence"
 	"github.com/hyperledger/fabric/core/container/externalbuilder"
 	"github.com/hyperledger/fabric/core/ledger"
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	ledgermock "github.com/hyperledger/fabric/core/ledger/mock"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -174,7 +176,7 @@ var _ = Describe("EventBroker", func() {
 				localChaincode.Info.PackageID = "external-built-cc"
 			})
 
-			It("does not invoke listener", func() {
+			It("delivers external-builder metadata", func() {
 				eventBroker.ProcessInstallEvent(localChaincode)
 				Expect(fakeListener.HandleChaincodeDeployCallCount()).To(Equal(1))
 				def, md := fakeListener.HandleChaincodeDeployArgsForCall(0)
@@ -196,6 +198,50 @@ var _ = Describe("EventBroker", func() {
 				}
 				Expect(mdContents).To(HaveKey("META-INF/"))
 				Expect(mdContents).To(HaveKey("META-INF/index.json"))
+			})
+
+			It("also delivers the consistency program bound into the package", func() {
+				program := &stateconsistency.ContractProgram{
+					SchemaVersion:        stateconsistency.ContractProgramSchemaVersion,
+					LevelEncoding:        stateconsistency.SignedIntegerLevelEncoding,
+					InitialLevel:         stateconsistency.NormalNumericLevel,
+					ChangeFunction:       stateconsistency.IncrementChange,
+					RelaxedTierThreshold: 10,
+				}
+				artifact, err := json.Marshal(program)
+				Expect(err).NotTo(HaveOccurred())
+				packageArtifacts := bytes.NewBuffer(nil)
+				writer := tar.NewWriter(packageArtifacts)
+				Expect(writer.WriteHeader(&tar.Header{
+					Name: stateconsistency.ContractProgramArtifact,
+					Mode: 0o644,
+					Size: int64(len(artifact)),
+				})).To(Succeed())
+				_, err = writer.Write(artifact)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(writer.Close()).To(Succeed())
+				pkgParser.ParseReturns(&persistence.ChaincodePackage{
+					DBArtifacts: packageArtifacts.Bytes(),
+				}, nil)
+
+				eventBroker.ProcessInstallEvent(localChaincode)
+				Expect(fakeListener.HandleChaincodeDeployCallCount()).To(Equal(1))
+				_, md := fakeListener.HandleChaincodeDeployArgsForCall(0)
+				mdContents := map[string][]byte{}
+				reader := tar.NewReader(bytes.NewReader(md))
+				for {
+					header, err := reader.Next()
+					if err == io.EOF {
+						break
+					}
+					Expect(err).NotTo(HaveOccurred())
+					contents, err := io.ReadAll(reader)
+					Expect(err).NotTo(HaveOccurred())
+					mdContents[header.Name] = contents
+				}
+				Expect(mdContents).To(HaveKey("META-INF/index.json"))
+				Expect(mdContents).To(HaveKey(stateconsistency.ContractProgramArtifact))
+				Expect(mdContents[stateconsistency.ContractProgramArtifact]).To(MatchJSON(artifact))
 			})
 		})
 

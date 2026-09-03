@@ -67,6 +67,75 @@ classify selected public state as strong or relaxed.
 a positive integer. Omitting it disables tier-triggered preventive
 synchronization for states selected by that rule.
 
+Lifecycle-deployed contract transition programs
+------------------------------------------------
+
+GraND can carry the result of offline contract analysis in the chaincode code
+package at ``META-INF/grand/consistency.json``. The package ID therefore binds
+the analysis result to the same bytes as the contract implementation. The
+``peer lifecycle chaincode package`` command accepts an existing result without
+requiring it to be copied into the contract source tree:
+
+.. code-block:: bash
+
+   peer lifecycle chaincode package basic.tar.gz \
+     --path ./chaincode-go \
+     --lang golang \
+     --label basic_1.0 \
+     --grand-consistency ./increment.json
+
+Schema version 1 is a small executable bridge for the offline/online interface:
+
+.. code-block:: json
+
+   {
+     "schemaVersion": 1,
+     "levelEncoding": "signed-integer-v1",
+     "initialLevel": 0,
+     "changeFunction": "increment",
+     "relaxedTierThreshold": 10
+   }
+
+The integer encoding is ``-1 = strong``, ``0 = normal``, and every positive
+value is a relaxed tier. ``identity`` and ``increment`` are the two supported
+change functions. For a state write, the peer takes the maximum level among
+state values actually read by that namespace and the destination key's prior
+level. With no existing input it starts at ``initialLevel``. ``identity``
+returns that level unchanged; ``increment`` adds one. Consequently a newly
+written value under ``increment`` starts at tier 1, and a read-modify-write of
+tier 1 produces tier 2.
+
+The lifecycle metadata broker delivers the program only after the package is
+installed and its chaincode definition is invocable on a channel. The peer
+stages it during ``HandleChaincodeDeploy``, publishes it only after the
+lifecycle completion callback, and persists its package ID, version, artifact
+SHA-256, and program in channel bookkeeping. It is reloaded on peer restart. A
+later package without this artifact removes the earlier deployed program after
+successful deployment.
+
+A lifecycle-deployed program takes precedence over the peer-start manifest for
+its chaincode namespace. Non-positive writes remain in canonical Fabric world
+state and carry both ``GRAND_CONSISTENCY_LEVEL`` and the signed integer metadata
+entry ``GRAND_CONSISTENCY_LEVEL_INT``. Positive writes use the existing
+peer-local relaxed-state and signed-evidence path. The deployed threshold is
+stored on relaxed records, but schema version 1 deliberately does not trigger
+threshold synchronization; ``relaxedTierThreshold: 10`` is reserved for that
+next stage.
+
+Both consistency metadata entries are managed by the deployed program and
+cannot be overwritten through chaincode ``SetStateMetadata`` calls. Other
+Fabric metadata is preserved for canonical state; peer-local relaxed state
+continues to reject metadata that has no local representation. If an external
+chaincode builder supplies release metadata, the lifecycle broker keeps that
+metadata while restoring the consistency artifact from the installed package,
+so the package-ID-bound analysis cannot be hidden or replaced by builder
+output.
+
+The full SSA ``tauPlan`` has per-call-site source and sink IDs and still needs
+runtime instrumentation to bind those IDs. The deployed schema above is the
+first uniform per-contract transition, not a replacement for that future
+per-path evaluator.
+
 Relaxed-state execution
 -----------------------
 

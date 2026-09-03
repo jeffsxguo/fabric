@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "levelEncoding": "signed-integer-v1",
+  "initialLevel": 0,
+  "changeFunction": "increment",
+  "relaxedTierThreshold": 10
+}

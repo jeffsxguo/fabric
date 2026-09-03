@@ -78,6 +78,28 @@ var _ = Describe("Package", func() {
 			Expect(metadata).To(MatchJSON(`{"path":"normalizedPath","type":"testType","label":"testLabel"}`))
 		})
 
+		It("embeds a GraND consistency analysis result in code.tar.gz", func() {
+			analysis := []byte(`{
+				"schemaVersion": 1,
+				"levelEncoding": "signed-integer-v1",
+				"initialLevel": 0,
+				"changeFunction": "increment",
+				"relaxedTierThreshold": 10
+			}`)
+			analysisPath := filepath.Join(GinkgoT().TempDir(), "consistency.json")
+			Expect(os.WriteFile(analysisPath, analysis, 0o600)).To(Succeed())
+			input.GrandConsistencyFile = analysisPath
+			mockPlatformRegistry.GetDeploymentPayloadReturns(codePackageBytes(nil), nil)
+
+			Expect(packager.Package()).To(Succeed())
+			_, _, packageBytes := mockWriter.WriteFileArgsForCall(0)
+			codeBytes, err := readOuterPackageFile(packageBytes, "code.tar.gz")
+			Expect(err).NotTo(HaveOccurred())
+			embedded, err := readCodePackageFile(codeBytes, "META-INF/grand/consistency.json")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(embedded).To(MatchJSON(analysis))
+		})
+
 		Context("when the path is not provided", func() {
 			BeforeEach(func() {
 				input.Path = ""
@@ -215,6 +237,10 @@ var _ = Describe("Package", func() {
 })
 
 func readMetadataFromBytes(pkgTarGzBytes []byte) ([]byte, error) {
+	return readOuterPackageFile(pkgTarGzBytes, "metadata.json")
+}
+
+func readOuterPackageFile(pkgTarGzBytes []byte, name string) ([]byte, error) {
 	buffer := bytes.NewBuffer(pkgTarGzBytes)
 	gzr, err := gzip.NewReader(buffer)
 	Expect(err).NotTo(HaveOccurred())
@@ -228,9 +254,31 @@ func readMetadataFromBytes(pkgTarGzBytes []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if header.Name == "metadata.json" {
+		if header.Name == name {
 			return io.ReadAll(tr)
 		}
 	}
-	return nil, errors.New("metadata.json not found")
+	return nil, errors.Errorf("%s not found", name)
+}
+
+func codePackageBytes(entries map[string][]byte) []byte {
+	buffer := bytes.NewBuffer(nil)
+	gzipWriter := gzip.NewWriter(buffer)
+	tarWriter := tar.NewWriter(gzipWriter)
+	for name, contents := range entries {
+		Expect(tarWriter.WriteHeader(&tar.Header{
+			Name: name,
+			Mode: 0o644,
+			Size: int64(len(contents)),
+		})).To(Succeed())
+		_, err := tarWriter.Write(contents)
+		Expect(err).NotTo(HaveOccurred())
+	}
+	Expect(tarWriter.Close()).To(Succeed())
+	Expect(gzipWriter.Close()).To(Succeed())
+	return buffer.Bytes()
+}
+
+func readCodePackageFile(codePackage []byte, name string) ([]byte, error) {
+	return readOuterPackageFile(codePackage, name)
 }

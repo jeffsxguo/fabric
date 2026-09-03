@@ -48,6 +48,15 @@ func TestHealthCheckRegister(t *testing.T) {
 	require.NotNil(t, arg2)
 }
 
+func TestGetChaincodeEventListenerForLevelDB(t *testing.T) {
+	env := &LevelDBTestEnv{}
+	env.Init(t)
+	defer env.Cleanup()
+
+	db := env.GetDBHandle(generateLedgerID(t))
+	require.Same(t, db, db.GetChaincodeEventListener())
+}
+
 func TestGetIndexInfo(t *testing.T) {
 	chaincodeIndexPath := "META-INF/statedb/couchdb/indexes"
 	actualIndexInfo := getIndexInfo(chaincodeIndexPath)

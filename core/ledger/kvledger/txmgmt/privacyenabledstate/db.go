@@ -13,6 +13,7 @@ import (
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
 	"github.com/hyperledger/fabric-lib-go/common/metrics"
 	"github.com/hyperledger/fabric-lib-go/healthz"
+	"github.com/hyperledger/fabric/common/ledger/util/leveldbhelper"
 	"github.com/hyperledger/fabric/core/common/ccprovider"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/cceventmgmt"
@@ -109,7 +110,8 @@ func (p *DBProvider) GetDBHandle(id string, chInfoProvider channelInfoProvider) 
 	if err != nil {
 		return nil, err
 	}
-	return NewDB(vdb, id, metadataHint)
+	contractProgramDB := p.bookkeepingProvider.GetDBHandle(id, bookkeeping.ContractConsistency)
+	return NewDB(vdb, id, metadataHint, contractProgramDB)
 }
 
 // Close closes all the VersionedDB instances and releases any resources held by VersionedDBProvider
@@ -125,13 +127,27 @@ func (p *DBProvider) Drop(ledgerid string) error {
 // DB uses a single database to maintain both the public and private data
 type DB struct {
 	statedb.VersionedDB
-	metadataHint *metadataHint
+	metadataHint     *metadataHint
+	contractPrograms *stateconsistency.ContractProgramRegistry
 }
 
 // NewDB wraps a VersionedDB instance. The public data is managed directly by the wrapped versionedDB.
 // For managing the hashed data and private data, this implementation creates separate namespaces in the wrapped db
-func NewDB(vdb statedb.VersionedDB, ledgerid string, metadataHint *metadataHint) (*DB, error) {
-	return &DB{vdb, metadataHint}, nil
+func NewDB(
+	vdb statedb.VersionedDB,
+	ledgerid string,
+	metadataHint *metadataHint,
+	contractProgramDB *leveldbhelper.DBHandle,
+) (*DB, error) {
+	contractPrograms, err := stateconsistency.NewContractProgramRegistry(contractProgramDB)
+	if err != nil {
+		return nil, errors.Wrap(err, "open deployed contract consistency programs")
+	}
+	return &DB{
+		VersionedDB:      vdb,
+		metadataHint:     metadataHint,
+		contractPrograms: contractPrograms,
+	}, nil
 }
 
 // IsBulkOptimizable checks whether the underlying statedb implements statedb.BulkOptimizable
@@ -180,14 +196,13 @@ func (s *DB) ClearCachedVersions() {
 	}
 }
 
-// GetChaincodeEventListener returns a struct that implements cceventmgmt.ChaincodeLifecycleEventListener
-// if the underlying statedb implements statedb.IndexCapable.
+// GetChaincodeEventListener returns the deployment listener used for both
+// CouchDB index artifacts and GraND contract consistency programs. The latter
+// must be installed for every state database implementation, including the
+// default GoLevelDB backend. HandleChaincodeDeploy retains the IndexCapable
+// check before processing CouchDB-specific artifacts.
 func (s *DB) GetChaincodeEventListener() cceventmgmt.ChaincodeLifecycleEventListener {
-	_, ok := s.VersionedDB.(statedb.IndexCapable)
-	if ok {
-		return s
-	}
-	return nil
+	return s
 }
 
 // GetPrivateData gets the value of a private data item identified by a tuple <namespace, collection, key>
@@ -292,6 +307,13 @@ func (s *DB) GetStateConsistencyLevel(namespace, key string) (stateconsistency.L
 	return statemetadata.DeserializeConsistencyLevel(metadata)
 }
 
+// ContractConsistencyProgram returns the offline analysis result deployed
+// with the chaincode package for this namespace. A missing result leaves the
+// legacy manifest policy in control.
+func (s *DB) ContractConsistencyProgram(namespace string) (*stateconsistency.DeployedContractProgram, bool) {
+	return s.contractPrograms.Lookup(namespace)
+}
+
 // GetPrivateDataMetadataByHash implements corresponding function in interface DB. For additional details, see
 // description of the similar function 'GetStateMetadata'
 func (s *DB) GetPrivateDataMetadataByHash(namespace, collection string, keyHash []byte) ([]byte, error) {
@@ -312,13 +334,35 @@ func (s *DB) GetPrivateDataMetadataByHash(namespace, collection string, keyHash 
 // is acceptable since peer can continue in the committing role without the indexes. However, executing chaincode queries
 // may be affected, until a new chaincode with fixed indexes is installed and instantiated
 func (s *DB) HandleChaincodeDeploy(chaincodeDefinition *cceventmgmt.ChaincodeDefinition, dbArtifactsTar []byte) error {
+	if chaincodeDefinition == nil {
+		return errors.New("chaincode definition not found while processing deployment artifacts")
+	}
+	deployedProgram, found, err := s.contractPrograms.StageDeployment(
+		chaincodeDefinition.Name,
+		chaincodeDefinition.Version,
+		string(chaincodeDefinition.Hash),
+		dbArtifactsTar,
+	)
+	if err != nil {
+		return errors.Wrapf(err, "deploy GraND consistency program for chaincode [%s]", chaincodeDefinition.Name)
+	}
+	if found {
+		logger.Infof(
+			"GraND contract consistency program staged: chaincode=%s version=%s package=%s artifact-sha256=%s change=%s initial=%d threshold=%d",
+			deployedProgram.ChaincodeName,
+			deployedProgram.Version,
+			deployedProgram.PackageID,
+			deployedProgram.ArtifactHash,
+			deployedProgram.Program.ChangeFunction,
+			deployedProgram.Program.InitialLevel,
+			deployedProgram.Program.RelaxedTierThreshold,
+		)
+	}
+
 	// Check to see if the interface for IndexCapable is implemented
 	indexCapable, ok := s.VersionedDB.(statedb.IndexCapable)
 	if !ok {
 		return nil
-	}
-	if chaincodeDefinition == nil {
-		return errors.New("chaincode definition not found while creating couchdb index")
 	}
 	dbArtifacts, err := ccprovider.ExtractFileEntries(dbArtifactsTar, indexCapable.GetDBType())
 	if err != nil {
@@ -356,9 +400,12 @@ func (s *DB) HandleChaincodeDeploy(chaincodeDefinition *cceventmgmt.ChaincodeDef
 	return nil
 }
 
-// ChaincodeDeployDone is a noop for couchdb state impl
+// ChaincodeDeployDone publishes or discards the staged GraND program. CouchDB
+// index deployment itself requires no completion callback.
 func (s *DB) ChaincodeDeployDone(succeeded bool) {
-	// NOOP
+	if err := s.contractPrograms.DeploymentDone(succeeded); err != nil {
+		logger.Errorf("Error persisting deployed GraND consistency program: %s", err)
+	}
 }
 
 func derivePvtDataNs(namespace, collection string) string {

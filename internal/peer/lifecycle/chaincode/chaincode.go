@@ -55,6 +55,7 @@ var (
 	channelID             string
 	chaincodeVersion      string
 	packageLabel          string
+	grandConsistencyFile  string
 	signaturePolicy       string
 	channelConfigPolicy   string
 	endorsementPlugin     string
@@ -99,6 +100,7 @@ func ResetFlags() {
 	flags.StringVarP(&chaincodeName, "name", "n", "", "Name of the chaincode")
 	flags.StringVarP(&chaincodeVersion, "version", "v", "", "Version of the chaincode")
 	flags.StringVarP(&packageLabel, "label", "", "", "The package label contains a human-readable description of the package")
+	flags.StringVar(&grandConsistencyFile, "grand-consistency", "", "Path to the GraND offline consistency analysis result to embed in the chaincode package")
 	flags.StringVarP(&channelID, "channelID", "C", "", "The channel on which this command should be executed")
 	flags.StringVarP(&signaturePolicy, "signature-policy", "", "", "The endorsement policy associated to this chaincode specified as a signature policy")
 	flags.StringVarP(&channelConfigPolicy, "channel-config-policy", "", "", "The endorsement policy associated to this chaincode specified as a channel config policy reference")

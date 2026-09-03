@@ -9,15 +9,19 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"io"
 	"strings"
+
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 )
 
 // The targz metadata provider is reference for other providers (such as what CAR would
-// implement). Currently it treats only statedb metadata but will be generalized in future
-// to allow for arbitrary metadata to be packaged with the chaincode.
+// implement). GraND additionally carries its offline consistency result through
+// the same lifecycle metadata path.
 const (
 	ccPackageStatedbDir = "META-INF/statedb/"
+	ccPackageGraNDDir   = "META-INF/grand/"
 )
 
 type PersistenceAdapter func([]byte) ([]byte, error)
@@ -26,7 +30,7 @@ func (pa PersistenceAdapter) GetDBArtifacts(codePackage []byte) ([]byte, error) 
 	return pa(codePackage)
 }
 
-// MetadataAsTarEntries extracts metadata from a chaincode package
+// MetadataAsTarEntries extracts deploy-time metadata from a chaincode package.
 func MetadataAsTarEntries(code []byte) ([]byte, error) {
 	is := bytes.NewReader(code)
 	gr, err := gzip.NewReader(is)
@@ -39,9 +43,10 @@ func MetadataAsTarEntries(code []byte) ([]byte, error) {
 	tw := tar.NewWriter(statedbTarBuffer)
 
 	tr := tar.NewReader(gr)
+	grandProgramFound := false
 
-	// For each file in the code package tar,
-	// add it to the statedb artifact tar if it has "statedb" in the path
+	// For each file in the code package tar, add state DB artifacts and GraND's
+	// offline analysis result to the lifecycle artifact tar.
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
@@ -52,7 +57,37 @@ func MetadataAsTarEntries(code []byte) ([]byte, error) {
 			return nil, err
 		}
 
-		if !strings.HasPrefix(header.Name, ccPackageStatedbDir) {
+		if !strings.HasPrefix(header.Name, ccPackageStatedbDir) &&
+			!strings.HasPrefix(header.Name, ccPackageGraNDDir) {
+			continue
+		}
+		if strings.HasPrefix(header.Name, ccPackageGraNDDir) &&
+			header.Name != stateconsistency.ContractProgramArtifact {
+			return nil, fmt.Errorf(
+				"unsupported GraND chaincode metadata path %q: expected %q",
+				header.Name,
+				stateconsistency.ContractProgramArtifact,
+			)
+		}
+		if header.Name == stateconsistency.ContractProgramArtifact {
+			if grandProgramFound {
+				return nil, fmt.Errorf("duplicate %s in chaincode package", header.Name)
+			}
+			grandProgramFound = true
+			contents, err := io.ReadAll(tr)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := stateconsistency.ParseContractProgram(contents); err != nil {
+				return nil, err
+			}
+			header.Size = int64(len(contents))
+			if err = tw.WriteHeader(header); err != nil {
+				return nil, err
+			}
+			if _, err = tw.Write(contents); err != nil {
+				return nil, err
+			}
 			continue
 		}
 

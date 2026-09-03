@@ -7,10 +7,14 @@ SPDX-License-Identifier: Apache-2.0
 package lifecycle
 
 import (
+	"archive/tar"
+	"bytes"
+	"io"
 	"sync"
 
 	"github.com/hyperledger/fabric/core/container/externalbuilder"
 	"github.com/hyperledger/fabric/core/ledger"
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	"github.com/pkg/errors"
 )
 
@@ -200,10 +204,6 @@ func (b *EventBroker) loadDBArtifacts(packageID string) ([]byte, error) {
 		return nil, err
 	}
 
-	if md != nil {
-		return md, nil
-	}
-
 	pkgBytes, err := b.chaincodeStore.Load(packageID)
 	if err != nil {
 		return nil, err
@@ -212,7 +212,62 @@ func (b *EventBroker) loadDBArtifacts(packageID string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if md != nil {
+		return mergePackageConsistencyProgram(md, pkg.DBArtifacts)
+	}
 	return pkg.DBArtifacts, nil
+}
+
+// mergePackageConsistencyProgram preserves external-builder release metadata
+// while restoring the consistency program bound into the installed package.
+// Fabric's external-builder metadata takes precedence over ordinary package
+// indexes, but it must not hide or replace GraND's package-ID-bound analysis.
+func mergePackageConsistencyProgram(externalArtifacts, packageArtifacts []byte) ([]byte, error) {
+	_, artifact, found, err := stateconsistency.ExtractContractProgram(packageArtifacts)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return externalArtifacts, nil
+	}
+
+	result := bytes.NewBuffer(nil)
+	writer := tar.NewWriter(result)
+	reader := tar.NewReader(bytes.NewReader(externalArtifacts))
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "read external-builder deployment metadata")
+		}
+		if header.Name == stateconsistency.ContractProgramArtifact {
+			// The installed package is the source of truth because its hash is
+			// included in the lifecycle package ID.
+			continue
+		}
+		if err := writer.WriteHeader(header); err != nil {
+			return nil, errors.Wrap(err, "copy external-builder deployment metadata header")
+		}
+		if _, err := io.Copy(writer, reader); err != nil {
+			return nil, errors.Wrap(err, "copy external-builder deployment metadata entry")
+		}
+	}
+	if err := writer.WriteHeader(&tar.Header{
+		Name: stateconsistency.ContractProgramArtifact,
+		Mode: 0o644,
+		Size: int64(len(artifact)),
+	}); err != nil {
+		return nil, errors.Wrap(err, "write GraND consistency deployment metadata header")
+	}
+	if _, err := writer.Write(artifact); err != nil {
+		return nil, errors.Wrap(err, "write GraND consistency deployment metadata")
+	}
+	if err := writer.Close(); err != nil {
+		return nil, errors.Wrap(err, "close merged deployment metadata")
+	}
+	return result.Bytes(), nil
 }
 
 // isChaincodeInvocable returns true iff a chaincode is approved and installed and defined

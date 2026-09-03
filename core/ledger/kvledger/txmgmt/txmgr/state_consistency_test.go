@@ -7,9 +7,13 @@ SPDX-License-Identifier: Apache-2.0
 package txmgr
 
 import (
+	"archive/tar"
+	"bytes"
+	"encoding/json"
 	"testing"
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
+	"github.com/hyperledger/fabric/core/ledger/cceventmgmt"
 	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 	"github.com/hyperledger/fabric/core/ledger/relaxedstate"
 	"github.com/stretchr/testify/require"
@@ -168,4 +172,159 @@ func TestTxSimulatorRejectsInvalidStateConsistencyLevel(t *testing.T) {
 		map[string][]byte{stateconsistency.MetadataKey: []byte("eventual")},
 	)
 	require.ErrorContains(t, err, "invalid state consistency level")
+}
+
+func TestDeployedIdentityProgramKeepsNormalStateCanonical(t *testing.T) {
+	env := testEnvsMap[levelDBtestEnvName]
+	env.init(t, "deployed-identity-consistency-program", nil)
+	defer env.cleanup()
+
+	deployContractProgram(t, env.getVDB(), "identitycc", stateconsistency.IdentityChange)
+	txMgr := env.getTxMgr()
+	legacyPolicy, err := stateconsistency.NewPolicy(&stateconsistency.Manifest{
+		Version: 1,
+		Rules: []stateconsistency.Rule{{
+			Namespace: "identitycc",
+			Level:     "strong",
+		}},
+	})
+	require.NoError(t, err)
+	txMgr.stateConsistency = legacyPolicy
+	help := newTxMgrTestHelper(t, txMgr)
+	simulator, err := txMgr.NewTxSimulator("identity-write")
+	require.NoError(t, err)
+	require.NoError(t, simulator.SetState("identitycc", "asset", []byte("value")))
+	validationKey := peer.MetaDataKeys_VALIDATION_PARAMETER.String()
+	require.NoError(t, simulator.SetStateMetadata(
+		"identitycc",
+		"asset",
+		map[string][]byte{validationKey: []byte("identity-policy")},
+	))
+	results, err := simulator.GetTxSimulationResults()
+	require.NoError(t, err)
+	require.Empty(t, simulator.(*txSimulator).GrandRelaxedStateSimulation().Writes)
+	simulator.Done()
+	help.validateAndCommitRWSet(results.PubSimulationResults)
+
+	query, err := txMgr.NewQueryExecutor("identity-query")
+	require.NoError(t, err)
+	defer query.Done()
+	value, err := query.GetState("identitycc", "asset")
+	require.NoError(t, err)
+	require.Equal(t, []byte("value"), value)
+	metadata, err := query.GetStateMetadata("identitycc", "asset")
+	require.NoError(t, err)
+	require.Equal(t, []byte("identity-policy"), metadata[validationKey])
+	require.Equal(t, []byte("0"), metadata[stateconsistency.NumericMetadataKey])
+	require.Equal(t, []byte(stateconsistency.Normal), metadata[stateconsistency.MetadataKey])
+
+	simulator, err = txMgr.NewTxSimulator("identity-reserved-metadata")
+	require.NoError(t, err)
+	defer simulator.Done()
+	err = simulator.SetStateMetadata(
+		"identitycc",
+		"asset",
+		map[string][]byte{stateconsistency.NumericMetadataKey: []byte("8")},
+	)
+	require.ErrorContains(t, err, "managed by the deployed GraND consistency program")
+}
+
+func TestDeployedIncrementProgramAdvancesRelaxedTierWithoutThresholdTrigger(t *testing.T) {
+	env := testEnvsMap[levelDBtestEnvName]
+	env.init(t, "deployed-increment-consistency-program", nil)
+	defer env.cleanup()
+
+	deployContractProgram(t, env.getVDB(), "incrementcc", stateconsistency.IncrementChange)
+	txMgr := env.getTxMgr()
+
+	first, err := txMgr.NewTxSimulator("increment-first-write")
+	require.NoError(t, err)
+	require.NoError(t, first.SetState("incrementcc", "asset", []byte("one")))
+	err = first.SetStateMetadata(
+		"incrementcc",
+		"asset",
+		map[string][]byte{peer.MetaDataKeys_VALIDATION_PARAMETER.String(): []byte("policy")},
+	)
+	require.ErrorContains(t, err, "not supported for peer-local relaxed state")
+	_, err = first.GetTxSimulationResults()
+	require.NoError(t, err)
+	firstSimulation := first.(*txSimulator).GrandRelaxedStateSimulation()
+	require.Len(t, firstSimulation.Writes, 1)
+	require.Equal(t, uint64(1), firstSimulation.Writes[0].Tier)
+	require.Equal(t, uint64(10), firstSimulation.Writes[0].TierThreshold)
+	require.False(t, firstSimulation.Writes[0].PreventiveSync)
+	first.Done()
+
+	seed := &relaxedstate.Simulation{
+		ChannelID: txMgr.ledgerid,
+		TxID:      "seed-deployed-tier",
+		Writes: []relaxedstate.Write{{
+			Namespace:     "incrementcc",
+			Key:           "existing",
+			Value:         []byte("four"),
+			Tier:          4,
+			TierThreshold: 10,
+		}},
+	}
+	require.NoError(t, txMgr.relaxedState.Stage(seed))
+	require.NoError(t, txMgr.relaxedState.StoreEvidence(seed.TxID, &relaxedstate.SignedEvidence{
+		Payload:   relaxedstate.NewEvidencePayload(seed, nil, nil),
+		Endorser:  []byte("test-peer"),
+		Signature: []byte("test-signature"),
+	}))
+	require.NoError(t, txMgr.relaxedState.Commit(seed.TxID, 1, nil))
+
+	next, err := txMgr.NewTxSimulator("increment-next-write")
+	require.NoError(t, err)
+	value, err := next.GetState("incrementcc", "existing")
+	require.NoError(t, err)
+	require.Equal(t, []byte("four"), value)
+	require.NoError(t, next.SetState("incrementcc", "existing", []byte("five")))
+	_, err = next.GetTxSimulationResults()
+	require.NoError(t, err)
+	nextSimulation := next.(*txSimulator).GrandRelaxedStateSimulation()
+	require.Len(t, nextSimulation.Reads, 1)
+	require.Equal(t, uint64(4), nextSimulation.Reads[0].Tier)
+	require.Len(t, nextSimulation.Writes, 1)
+	require.Equal(t, uint64(5), nextSimulation.Writes[0].Tier)
+	require.Equal(t, uint64(10), nextSimulation.Writes[0].TierThreshold)
+	require.False(t, nextSimulation.Writes[0].PreventiveSync)
+	next.Done()
+}
+
+func deployContractProgram(
+	t *testing.T,
+	db interface {
+		HandleChaincodeDeploy(*cceventmgmt.ChaincodeDefinition, []byte) error
+		ChaincodeDeployDone(bool)
+	},
+	chaincodeName,
+	changeFunction string,
+) {
+	t.Helper()
+	program := stateconsistency.ContractProgram{
+		SchemaVersion:        stateconsistency.ContractProgramSchemaVersion,
+		LevelEncoding:        stateconsistency.SignedIntegerLevelEncoding,
+		InitialLevel:         stateconsistency.NormalNumericLevel,
+		ChangeFunction:       changeFunction,
+		RelaxedTierThreshold: 10,
+	}
+	artifact, err := json.Marshal(program)
+	require.NoError(t, err)
+	metadataTar := bytes.NewBuffer(nil)
+	writer := tar.NewWriter(metadataTar)
+	require.NoError(t, writer.WriteHeader(&tar.Header{
+		Name: stateconsistency.ContractProgramArtifact,
+		Mode: 0o644,
+		Size: int64(len(artifact)),
+	}))
+	_, err = writer.Write(artifact)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	require.NoError(t, db.HandleChaincodeDeploy(&cceventmgmt.ChaincodeDefinition{
+		Name:    chaincodeName,
+		Version: "1.0",
+		Hash:    []byte(chaincodeName + ":package-id"),
+	}, metadataTar.Bytes()))
+	db.ChaincodeDeployDone(true)
 }

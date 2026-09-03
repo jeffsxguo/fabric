@@ -94,6 +94,29 @@ func TestBadMetadataExtension(t *testing.T) {
 	require.Error(t, err, "Should have received an error")
 }
 
+func TestGraNDContractConsistencyMetadata(t *testing.T) {
+	valid := []byte(`{
+		"schemaVersion": 1,
+		"levelEncoding": "signed-integer-v1",
+		"initialLevel": 0,
+		"changeFunction": "increment",
+		"relaxedTierThreshold": 10
+	}`)
+	require.NoError(t, ValidateMetadataFile("META-INF/grand/consistency.json", valid))
+
+	err := ValidateMetadataFile("META-INF/grand/consistency.json", []byte(`{
+		"schemaVersion": 1,
+		"levelEncoding": "signed-integer-v1",
+		"initialLevel": 0,
+		"changeFunction": "subtract",
+		"relaxedTierThreshold": 10
+	}`))
+	require.ErrorContains(t, err, "unsupported consistency change function")
+
+	err = ValidateMetadataFile("META-INF/grand/other.json", valid)
+	require.ErrorContains(t, err, "must be META-INF/grand/consistency.json")
+}
+
 func TestBadFilePaths(t *testing.T) {
 	testDir := filepath.Join(packageTestDir, "BadMetadataExtension")
 	cleanupDir(testDir)

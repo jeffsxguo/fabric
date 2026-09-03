@@ -39,6 +39,7 @@ type queryExecutor struct {
 	txid              string
 	privateReads      *ledger.PrivateReads
 	relaxedReads      map[string]relaxedstate.Read
+	contractReads     map[string]map[string]int64
 }
 
 func newQueryExecutor(txmgr *LockBasedTxMgr,
@@ -60,6 +61,7 @@ func newQueryExecutor(txmgr *LockBasedTxMgr,
 	qe.collNameValidator = validator
 	qe.privateReads = &ledger.PrivateReads{}
 	qe.relaxedReads = map[string]relaxedstate.Read{}
+	qe.contractReads = map[string]map[string]int64{}
 	return qe
 }
 
@@ -72,6 +74,45 @@ func (q *queryExecutor) GetState(ns, key string) ([]byte, error) {
 func (q *queryExecutor) getState(ns, key string) ([]byte, []byte, error) {
 	if err := q.checkDone(); err != nil {
 		return nil, nil, err
+	}
+	if _, deployed := q.txmgr.db.ContractConsistencyProgram(ns); deployed {
+		record, err := q.txmgr.relaxedState.GetRecord(ns, key)
+		if err != nil {
+			return nil, nil, err
+		}
+		if record != nil {
+			level := int64(record.Tier)
+			q.recordContractRead(ns, key, level)
+			if q.collectReadset {
+				q.relaxedReads[ns+"\x00"+key] = relaxedstate.Read{
+					Namespace: ns,
+					Key:       key,
+					Value:     append([]byte(nil), record.Value...),
+					Tier:      record.Tier,
+				}
+			}
+			return append([]byte(nil), record.Value...), nil, nil
+		}
+		versionedValue, err := q.txmgr.db.GetState(ns, key)
+		if err != nil {
+			return nil, nil, err
+		}
+		val, metadata, ver := decomposeVersionedValue(versionedValue)
+		if q.collectReadset {
+			q.rwsetBuilder.AddToReadSet(ns, key, ver)
+		}
+		if versionedValue != nil {
+			deserialized, err := statemetadata.Deserialize(metadata)
+			if err != nil {
+				return nil, nil, err
+			}
+			level, err := stateconsistency.NumericLevelFromMetadata(deserialized)
+			if err != nil {
+				return nil, nil, err
+			}
+			q.recordContractRead(ns, key, level)
+		}
+		return val, metadata, nil
 	}
 	if level, explicit := q.txmgr.stateConsistency.Resolve(ns, key); explicit && level == stateconsistency.Relaxed {
 		record, err := q.txmgr.relaxedState.GetRecord(ns, key)
@@ -107,6 +148,32 @@ func (q *queryExecutor) GetStateMetadata(ns, key string) (map[string][]byte, err
 	if err := q.checkDone(); err != nil {
 		return nil, err
 	}
+	if _, deployed := q.txmgr.db.ContractConsistencyProgram(ns); deployed {
+		record, err := q.txmgr.relaxedState.GetRecord(ns, key)
+		if err != nil {
+			return nil, err
+		}
+		if record != nil {
+			if q.collectReadset {
+				if _, _, err := q.getState(ns, key); err != nil {
+					return nil, err
+				}
+			} else {
+				q.recordContractRead(ns, key, int64(record.Tier))
+			}
+			return stateconsistency.WithNumericLevel(nil, int64(record.Tier))
+		}
+		var metadata []byte
+		if !q.collectReadset {
+			metadata, err = q.txmgr.db.GetStateMetadata(ns, key)
+		} else {
+			_, metadata, err = q.getState(ns, key)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return statemetadata.Deserialize(metadata)
+	}
 	if level, explicit := q.txmgr.stateConsistency.Resolve(ns, key); explicit && level == stateconsistency.Relaxed {
 		return stateconsistency.WithLevel(nil, stateconsistency.Relaxed)
 	}
@@ -122,6 +189,24 @@ func (q *queryExecutor) GetStateMetadata(ns, key string) (map[string][]byte, err
 		}
 	}
 	return statemetadata.Deserialize(metadata)
+}
+
+func (q *queryExecutor) recordContractRead(namespace, key string, level int64) {
+	levels := q.contractReads[namespace]
+	if levels == nil {
+		levels = map[string]int64{}
+		q.contractReads[namespace] = levels
+	}
+	levels[key] = level
+}
+
+func (q *queryExecutor) contractInputLevels(namespace string) []int64 {
+	levels := q.contractReads[namespace]
+	result := make([]int64, 0, len(levels))
+	for _, level := range levels {
+		result = append(result, level)
+	}
+	return result
 }
 
 // GetStateMultipleKeys implements method in interface `ledger.QueryExecutor`

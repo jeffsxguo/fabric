@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
+	stateconsistency "github.com/hyperledger/fabric/core/ledger/consistency"
 )
 
 var logger = flogging.MustGetLogger("chaincode.platform.metadata")
@@ -26,10 +27,11 @@ type fileValidator func(fileName string, fileBytes []byte) error
 // AllowedCharsCollectionName captures the regex pattern for a valid collection name
 const AllowedCharsCollectionName = "[A-Za-z0-9_-]+"
 
-// Currently, the only metadata expected and allowed is for META-INF/statedb/couchdb/indexes.
+// Metadata may contain CouchDB indexes or GraND's offline consistency result.
 var fileValidators = map[*regexp.Regexp]fileValidator{
 	regexp.MustCompile("^META-INF/statedb/couchdb/indexes/.*[.]json"):                                                couchdbIndexFileValidator,
 	regexp.MustCompile("^META-INF/statedb/couchdb/collections/" + AllowedCharsCollectionName + "/indexes/.*[.]json"): couchdbIndexFileValidator,
+	regexp.MustCompile("^" + regexp.QuoteMeta(stateconsistency.ContractProgramArtifact) + "$"):                       contractProgramFileValidator,
 }
 
 var collectionNameValid = regexp.MustCompile("^" + AllowedCharsCollectionName)
@@ -79,6 +81,13 @@ func ValidateMetadataFile(filePathName string, fileBytes []byte) error {
 func buildMetadataFileErrorMessage(filePathName string) string {
 	dir, filename := filepath.Split(filePathName)
 
+	if strings.HasPrefix(filePathName, "META-INF/grand") {
+		return fmt.Sprintf(
+			"GraND metadata path must be %s, found: %s",
+			stateconsistency.ContractProgramArtifact,
+			filePathName,
+		)
+	}
 	if !strings.HasPrefix(filePathName, "META-INF/statedb") {
 		return fmt.Sprintf("metadata file path must begin with META-INF/statedb, found: %s", dir)
 	}
@@ -114,6 +123,13 @@ func buildMetadataFileErrorMessage(filePathName string) string {
 	}
 
 	return fmt.Sprintf("metadata file path or name is not supported: %s", dir)
+}
+
+func contractProgramFileValidator(fileName string, fileBytes []byte) error {
+	if _, err := stateconsistency.ParseContractProgram(fileBytes); err != nil {
+		return fmt.Errorf("GraND consistency metadata file [%s] is invalid: %w", fileName, err)
+	}
+	return nil
 }
 
 func contains(validStrings []string, target string) bool {
