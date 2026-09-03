@@ -553,6 +553,93 @@ func TestGrandRelaxedEvidenceIsCarriedButExcludedFromProposalHash(t *testing.T) 
 	require.Equal(t, [][]byte{[]byte("evidence-1"), []byte("evidence-2")}, bundle)
 }
 
+func TestGrandThreeOfFourProposalGroupsEnterOrderedEnvelope(t *testing.T) {
+	plainPayload := protoutil.MarshalOrPanic(&pb.ChaincodeProposalPayload{Input: []byte("invoke")})
+	signer := &fakes.SignerSerializer{}
+	signer.SerializeReturns([]byte("creator"), nil)
+	proposal := &pb.Proposal{
+		Header: protoutil.MarshalOrPanic(&cb.Header{
+			ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{}),
+			SignatureHeader: protoutil.MarshalOrPanic(&cb.SignatureHeader{
+				Creator: []byte("creator"),
+			}),
+		}),
+		Payload: plainPayload,
+	}
+	response := func(payload, endorser, evidence string) *pb.ProposalResponse {
+		return &pb.ProposalResponse{
+			Payload: []byte(payload),
+			Response: &pb.Response{
+				Status:  200,
+				Message: protoutil.GrandRelaxedEvidenceMessagePrefix + base64.StdEncoding.EncodeToString([]byte(evidence)),
+			},
+			Endorsement: &pb.Endorsement{Endorser: []byte(endorser), Signature: []byte("signature-" + endorser)},
+		}
+	}
+	responses := []*pb.ProposalResponse{
+		response("majority", "org1", "evidence-1"),
+		response("majority", "org2", "evidence-2"),
+		response("majority", "org3", "evidence-3"),
+		response("minority", "org4", "evidence-4"),
+	}
+
+	envelope, err := protoutil.CreateSignedTx(proposal, signer, responses...)
+	require.NoError(t, err)
+	envelopeBytes, err := proto.Marshal(envelope)
+	require.NoError(t, err)
+	bundle, err := protoutil.GetGrandRelaxedEvidenceBundleFromEnvelope(envelopeBytes)
+	require.NoError(t, err)
+	require.Len(t, bundle.Evidence, 4)
+	require.Len(t, bundle.ProposalGroups, 2)
+	require.Equal(t, []byte("majority"), bundle.ProposalGroups[0].ProposalResponsePayload)
+	require.Len(t, bundle.ProposalGroups[0].Endorsements, 3)
+	require.Equal(t, []byte("minority"), bundle.ProposalGroups[1].ProposalResponsePayload)
+	require.Len(t, bundle.ProposalGroups[1].Endorsements, 1)
+
+	payload := protoutil.UnmarshalPayloadOrPanic(envelope.Payload)
+	transaction, err := protoutil.UnmarshalTransaction(payload.Data)
+	require.NoError(t, err)
+	action, err := protoutil.UnmarshalChaincodeActionPayload(transaction.Actions[0].Payload)
+	require.NoError(t, err)
+	require.Equal(t, []byte("majority"), action.Action.ProposalResponsePayload)
+	require.Len(t, action.Action.Endorsements, 3)
+}
+
+func TestGrandTwoTwoProposalGroupsDoNotMeetTwoThirdsThreshold(t *testing.T) {
+	plainPayload := protoutil.MarshalOrPanic(&pb.ChaincodeProposalPayload{Input: []byte("invoke")})
+	signer := &fakes.SignerSerializer{}
+	signer.SerializeReturns([]byte("creator"), nil)
+	proposal := &pb.Proposal{
+		Header: protoutil.MarshalOrPanic(&cb.Header{
+			ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{}),
+			SignatureHeader: protoutil.MarshalOrPanic(&cb.SignatureHeader{
+				Creator: []byte("creator"),
+			}),
+		}),
+		Payload: plainPayload,
+	}
+	response := func(payload, endorser string) *pb.ProposalResponse {
+		return &pb.ProposalResponse{
+			Payload: []byte(payload),
+			Response: &pb.Response{
+				Status:  200,
+				Message: protoutil.GrandRelaxedEvidenceMessagePrefix + base64.StdEncoding.EncodeToString([]byte("evidence-"+endorser)),
+			},
+			Endorsement: &pb.Endorsement{Endorser: []byte(endorser), Signature: []byte("signature-" + endorser)},
+		}
+	}
+
+	_, err := protoutil.CreateSignedTx(
+		proposal,
+		signer,
+		response("first", "org1"),
+		response("first", "org2"),
+		response("second", "org3"),
+		response("second", "org4"),
+	)
+	require.ErrorContains(t, err, "ProposalResponsePayloads do not match")
+}
+
 func TestComputeGrandActiveSyncMedianFromThreeOfFourPeers(t *testing.T) {
 	// Org3 is the fourth, unavailable peer. Org4 contributes an extreme
 	// Byzantine observation, which cannot move the three-value median outside

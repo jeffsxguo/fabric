@@ -8,6 +8,7 @@ package txmgr
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"path/filepath"
 	"sync"
@@ -655,7 +656,7 @@ func (txmgr *LockBasedTxMgr) validateRelaxedStateEvidence(block *common.Block) {
 			var activeSync *relaxedstate.ActiveSyncResult
 			if bundle != nil {
 				evidence = bundle.Evidence
-				err = validateGrandEvidenceEndorsers(transaction, evidence)
+				err = validateGrandEvidenceEndorsers(txmgr.ledgerid, transaction, bundle)
 				if err == nil {
 					err = validateGrandActiveSyncBundle(bundle)
 				}
@@ -716,8 +717,15 @@ func (txmgr *LockBasedTxMgr) commitRelaxedState(block *common.Block) error {
 	return nil
 }
 
-func validateGrandEvidenceEndorsers(transaction []byte, evidenceBundle [][]byte) error {
+func validateGrandEvidenceEndorsers(channelID string, transaction []byte, bundle *protoutil.GrandRelaxedEvidenceBundle) error {
+	if bundle == nil {
+		return nil
+	}
+	evidenceBundle := bundle.Evidence
 	if len(evidenceBundle) == 0 {
+		if len(bundle.ProposalGroups) > 0 {
+			return errors.New("GraND proposal groups require relaxed evidence")
+		}
 		return nil
 	}
 	canonicalEndorsers, err := protoutil.GetGrandCanonicalEndorsersFromEnvelope(transaction)
@@ -731,6 +739,16 @@ func validateGrandEvidenceEndorsers(transaction []byte, evidenceBundle [][]byte)
 	endorserSet := map[string]struct{}{}
 	for _, endorser := range canonicalEndorsers {
 		endorserSet[string(endorser)] = struct{}{}
+	}
+	if len(bundle.ProposalGroups) > 0 {
+		return validateGrandProposalGroups(
+			channelID,
+			bundle.ProposalGroups,
+			evidenceBundle,
+			endorserSet,
+			proposalHash,
+			canonicalResultHash,
+		)
 	}
 	for index, encoded := range evidenceBundle {
 		evidence := &relaxedstate.SignedEvidence{}
@@ -746,6 +764,150 @@ func validateGrandEvidenceEndorsers(transaction []byte, evidenceBundle [][]byte)
 		}
 	}
 	return nil
+}
+
+func validateGrandProposalGroups(
+	channelID string,
+	groups []protoutil.GrandProposalGroup,
+	evidenceBundle [][]byte,
+	canonicalEndorsers map[string]struct{},
+	proposalHash, canonicalResultHash []byte,
+) error {
+	if len(groups) < 2 {
+		return errors.New("GraND divergent proposal bundle must contain at least two groups")
+	}
+
+	groupHashByEndorser := map[string][]byte{}
+	seenPayloads := map[string]struct{}{}
+	canonicalGroupFound := false
+	canonicalGroupSize := 0
+	totalEndorsers := 0
+	for groupIndex, group := range groups {
+		if len(group.ProposalResponsePayload) == 0 || len(group.Endorsements) == 0 {
+			return errors.Errorf("GraND proposal group %d is empty", groupIndex)
+		}
+		payloadKey := string(group.ProposalResponsePayload)
+		if _, duplicate := seenPayloads[payloadKey]; duplicate {
+			return errors.Errorf("GraND proposal group %d repeats a result payload", groupIndex)
+		}
+		seenPayloads[payloadKey] = struct{}{}
+		responsePayload, err := protoutil.UnmarshalProposalResponsePayload(group.ProposalResponsePayload)
+		if err != nil {
+			return errors.Wrapf(err, "decode GraND proposal group %d", groupIndex)
+		}
+		if !bytes.Equal(responsePayload.ProposalHash, proposalHash) {
+			return errors.Errorf("GraND proposal group %d is not bound to the ordered proposal", groupIndex)
+		}
+		resultDigest := sha256.Sum256(group.ProposalResponsePayload)
+		resultHash := resultDigest[:]
+		isCanonical := bytes.Equal(resultHash, canonicalResultHash)
+		groupEndorsers := map[string]struct{}{}
+		for endorsementIndex, endorsement := range group.Endorsements {
+			endorserKey := string(endorsement.Endorser)
+			if len(endorsement.Endorser) == 0 || len(endorsement.Signature) == 0 {
+				return errors.Errorf("GraND proposal group %d endorsement %d is incomplete", groupIndex, endorsementIndex)
+			}
+			if _, duplicate := groupEndorsers[endorserKey]; duplicate {
+				return errors.Errorf("GraND proposal group %d repeats an endorser", groupIndex)
+			}
+			if _, duplicate := groupHashByEndorser[endorserKey]; duplicate {
+				return errors.Errorf("GraND proposal groups assign one endorser to multiple results")
+			}
+			if err := verifyGrandProposalEndorsement(channelID, group.ProposalResponsePayload, endorsement); err != nil {
+				return errors.Wrapf(err, "verify GraND proposal group %d endorsement %d", groupIndex, endorsementIndex)
+			}
+			groupEndorsers[endorserKey] = struct{}{}
+			groupHashByEndorser[endorserKey] = resultHash
+			totalEndorsers++
+		}
+		if isCanonical {
+			if canonicalGroupFound {
+				return errors.New("multiple GraND proposal groups match the canonical result")
+			}
+			canonicalGroupFound = true
+			canonicalGroupSize = len(groupEndorsers)
+			if len(groupEndorsers) != len(canonicalEndorsers) {
+				return errors.New("canonical GraND proposal group does not match canonical endorsements")
+			}
+			for endorser := range groupEndorsers {
+				if _, ok := canonicalEndorsers[endorser]; !ok {
+					return errors.New("canonical GraND proposal group contains a non-canonical endorser")
+				}
+			}
+		}
+	}
+	if !canonicalGroupFound {
+		return errors.New("GraND proposal groups omit the canonical result")
+	}
+	required := (2*totalEndorsers + 2) / 3
+	if canonicalGroupSize < required {
+		return errors.Errorf(
+			"canonical GraND proposal group has %d endorsements; 2/3 threshold requires %d of %d",
+			canonicalGroupSize,
+			required,
+			totalEndorsers,
+		)
+	}
+
+	evidenceEndorsers := map[string]struct{}{}
+	for index, encoded := range evidenceBundle {
+		evidence := &relaxedstate.SignedEvidence{}
+		if err := json.Unmarshal(encoded, evidence); err != nil {
+			return errors.Wrapf(err, "decode relaxed evidence %d", index)
+		}
+		endorserKey := string(evidence.Endorser)
+		expectedResultHash, ok := groupHashByEndorser[endorserKey]
+		if !ok {
+			return errors.Errorf("relaxed evidence %d is not bound to an ordered proposal group", index)
+		}
+		if _, duplicate := evidenceEndorsers[endorserKey]; duplicate {
+			return errors.Errorf("relaxed evidence repeats a proposal-group endorser")
+		}
+		if !bytes.Equal(evidence.Payload.ProposalHash, proposalHash) ||
+			!bytes.Equal(evidence.Payload.CanonicalResultHash, expectedResultHash) {
+			return errors.Errorf("relaxed evidence %d is not bound to its ordered proposal group", index)
+		}
+		evidenceEndorsers[endorserKey] = struct{}{}
+	}
+	if len(evidenceEndorsers) != totalEndorsers {
+		return errors.Errorf(
+			"GraND proposal groups contain %d endorsers but only %d evidence records",
+			totalEndorsers,
+			len(evidenceEndorsers),
+		)
+	}
+	return nil
+}
+
+func verifyGrandProposalEndorsement(
+	channelID string,
+	payload []byte,
+	endorsement protoutil.GrandProposalEndorsement,
+) error {
+	identity, err := mspmgmt.GetManagerForChain(channelID).DeserializeIdentity(endorsement.Endorser)
+	if err != nil {
+		return err
+	}
+	if err := identity.Validate(); err != nil {
+		return err
+	}
+	roleBytes, err := proto.Marshal(&mspproto.MSPRole{
+		Role:          mspproto.MSPRole_PEER,
+		MspIdentifier: identity.GetMSPIdentifier(),
+	})
+	if err != nil {
+		return err
+	}
+	if err := identity.SatisfiesPrincipal(&mspproto.MSPPrincipal{
+		PrincipalClassification: mspproto.MSPPrincipal_ROLE,
+		Principal:               roleBytes,
+	}); err != nil {
+		return errors.Wrap(err, "proposal-group endorser is not a channel peer")
+	}
+	signingBytes := make([]byte, 0, len(payload)+len(endorsement.Endorser))
+	signingBytes = append(signingBytes, payload...)
+	signingBytes = append(signingBytes, endorsement.Endorser...)
+	return identity.Verify(signingBytes, endorsement.Signature)
 }
 
 func validateGrandActiveSyncBundle(bundle *protoutil.GrandRelaxedEvidenceBundle) error {

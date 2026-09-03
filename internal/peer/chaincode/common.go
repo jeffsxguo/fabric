@@ -566,6 +566,13 @@ func ChaincodeInvokeOrQuery(
 			if err != nil {
 				return proposalResp, errors.WithMessage(err, "could not decode assembled GraND transaction")
 			}
+			if grandBundle != nil && len(grandBundle.ProposalGroups) > 1 {
+				fmt.Printf(
+					"%s%s\n",
+					protoutil.GrandOrderedProposalGroupsMessagePrefix,
+					grandPassiveDivergenceSummary(responses),
+				)
+			}
 			var dg *DeliverGroup
 			var ctx context.Context
 			if waitForEvent {

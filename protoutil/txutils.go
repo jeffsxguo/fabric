@@ -29,6 +29,9 @@ const (
 	// an opaque evidence bundle. Unlike application transient data, validators
 	// intentionally preserve and inspect this reserved entry.
 	GrandRelaxedEvidenceTransientKey = "GRAND_RELAXED_EVIDENCE_V1"
+	// GrandOrderedProposalGroupsMessagePrefix marks a GraND transaction that
+	// retained multiple endorsed proposal-result groups in the ordered envelope.
+	GrandOrderedProposalGroupsMessagePrefix = "GRAND_ORDERED_PROPOSAL_GROUPS_V1:"
 	// GrandActiveSyncRequestMessage is the byte-identical chaincode response
 	// marker that asks endorsers to certify the relaxed value they read.
 	GrandActiveSyncRequestMessage = "GRAND_ACTIVE_SYNC_MEDIAN_JSON_PRICE_V1"
@@ -43,12 +46,28 @@ const (
 )
 
 // GrandRelaxedEvidenceBundle is retained in the ordered transaction. Evidence
-// contains peer-local signed observations; ActiveSync contains the deterministic
-// aggregate that validators must recompute before accepting the transaction.
+// contains peer-local signed observations; ProposalGroups preserves every exact
+// divergent ProposalResponsePayload group and its endorsements; ActiveSync
+// contains the deterministic aggregate that validators must recompute before
+// accepting the transaction.
 type GrandRelaxedEvidenceBundle struct {
-	Version    int                    `json:"version"`
-	Evidence   [][]byte               `json:"evidence"`
-	ActiveSync *GrandActiveSyncResult `json:"activeSync,omitempty"`
+	Version        int                    `json:"version"`
+	Evidence       [][]byte               `json:"evidence"`
+	ProposalGroups []GrandProposalGroup   `json:"proposalGroups,omitempty"`
+	ActiveSync     *GrandActiveSyncResult `json:"activeSync,omitempty"`
+}
+
+// GrandProposalGroup is one exact result of executing the same proposal. The
+// canonical action uses the 2/3 group while every group remains in this bundle
+// so validators and later recovery logic observe what was actually endorsed.
+type GrandProposalGroup struct {
+	ProposalResponsePayload []byte                     `json:"proposalResponsePayload"`
+	Endorsements            []GrandProposalEndorsement `json:"endorsements"`
+}
+
+type GrandProposalEndorsement struct {
+	Endorser  []byte `json:"endorser"`
+	Signature []byte `json:"signature"`
 }
 
 type GrandActiveSyncResult struct {
@@ -250,28 +269,28 @@ func CreateSignedTx(
 		return nil, errors.New("signer must be the same as the one referenced in the header")
 	}
 
-	// ensure that all actions are bitwise equal and that they are successful
-	var a1 []byte
-	for n, r := range resps {
+	// Ensure that every response is successful. Standard Fabric transactions
+	// still require one byte-identical result. A GraND proposal carrying signed
+	// relaxed observations may instead form several exact groups; when one group
+	// reaches the temporary 2/3 threshold, it becomes the canonical action while
+	// every group is retained in the ordered GraND bundle.
+	for _, r := range resps {
+		if r == nil || r.Response == nil {
+			return nil, errors.New("proposal response is missing")
+		}
 		if r.Response.Status < 200 || r.Response.Status >= 400 {
 			return nil, errors.Errorf("proposal response was not successful, error code %d, msg %s", r.Response.Status, r.Response.Message)
 		}
-
-		if n == 0 {
-			a1 = r.Payload
-			continue
-		}
-
-		if !bytes.Equal(a1, r.Payload) {
-			return nil, errors.Errorf("ProposalResponsePayloads do not match (base64): '%s' vs '%s'",
-				b64.StdEncoding.EncodeToString(r.Payload), b64.StdEncoding.EncodeToString(a1))
-		}
+	}
+	canonicalResponses, proposalGroups, err := selectGrandCanonicalResponses(resps)
+	if err != nil {
+		return nil, err
 	}
 
 	// fill endorsements according to their uniqueness
 	endorsersUsed := make(map[string]struct{})
 	var endorsements []*peer.Endorsement
-	for _, r := range resps {
+	for _, r := range canonicalResponses {
 		if r.Endorsement == nil {
 			continue
 		}
@@ -288,10 +307,10 @@ func CreateSignedTx(
 	}
 
 	// create ChaincodeEndorsedAction
-	cea := &peer.ChaincodeEndorsedAction{ProposalResponsePayload: resps[0].Payload, Endorsements: endorsements}
+	cea := &peer.ChaincodeEndorsedAction{ProposalResponsePayload: canonicalResponses[0].Payload, Endorsements: endorsements}
 
 	// obtain the bytes of the proposal payload that will go to the transaction
-	propPayloadBytes, err := proposalPayloadForTxWithGrandEvidence(pPayl, resps)
+	propPayloadBytes, err := proposalPayloadForTxWithGrandEvidence(pPayl, resps, proposalGroups)
 	if err != nil {
 		return nil, err
 	}
@@ -576,6 +595,7 @@ func GetProposalHash2(header *common.Header, ccPropPayl []byte) ([]byte, error) 
 func proposalPayloadForTxWithGrandEvidence(
 	payload *peer.ChaincodeProposalPayload,
 	responses []*peer.ProposalResponse,
+	proposalGroups []GrandProposalGroup,
 ) ([]byte, error) {
 	evidence := make([][]byte, 0, len(responses))
 	for _, response := range responses {
@@ -598,8 +618,9 @@ func proposalPayloadForTxWithGrandEvidence(
 		return bytes.Compare(evidence[i], evidence[j]) < 0
 	})
 	evidenceBundle := &GrandRelaxedEvidenceBundle{
-		Version:  grandRelaxedEvidenceBundleVersion,
-		Evidence: evidence,
+		Version:        grandRelaxedEvidenceBundleVersion,
+		Evidence:       evidence,
+		ProposalGroups: proposalGroups,
 	}
 	if grandEvidenceIncludesActiveSync(evidence) {
 		activeSync, err := ComputeGrandActiveSyncResult(evidence)
@@ -618,6 +639,104 @@ func proposalPayloadForTxWithGrandEvidence(
 			GrandRelaxedEvidenceTransientKey: bundle,
 		},
 	})
+}
+
+// selectGrandCanonicalResponses preserves standard Fabric behavior unless
+// every divergent response carries a GraND relaxed-state endorsement. For a
+// GraND divergence, it selects an exact group only when that group contains at
+// least ceil(2n/3) distinct endorsers. All exact groups are returned for
+// retention in the ordered envelope.
+func selectGrandCanonicalResponses(responses []*peer.ProposalResponse) ([]*peer.ProposalResponse, []GrandProposalGroup, error) {
+	allMatch := true
+	for index := 1; index < len(responses); index++ {
+		if !bytes.Equal(responses[0].Payload, responses[index].Payload) {
+			allMatch = false
+			break
+		}
+	}
+	if allMatch {
+		return responses, nil, nil
+	}
+
+	type responseGroup struct {
+		payload   []byte
+		responses []*peer.ProposalResponse
+		seen      map[string]struct{}
+	}
+	groupsByPayload := map[string]*responseGroup{}
+	seenEndorsers := map[string]struct{}{}
+	for _, response := range responses {
+		if response.Endorsement == nil || len(response.Endorsement.Endorser) == 0 ||
+			!strings.HasPrefix(response.Response.Message, GrandRelaxedEvidenceMessagePrefix) {
+			return nil, nil, proposalResponseMismatchError(responses)
+		}
+		endorserKey := string(response.Endorsement.Endorser)
+		if _, duplicate := seenEndorsers[endorserKey]; duplicate {
+			continue
+		}
+		seenEndorsers[endorserKey] = struct{}{}
+		payloadKey := string(response.Payload)
+		group := groupsByPayload[payloadKey]
+		if group == nil {
+			group = &responseGroup{payload: response.Payload, seen: map[string]struct{}{}}
+			groupsByPayload[payloadKey] = group
+		}
+		group.responses = append(group.responses, response)
+		group.seen[endorserKey] = struct{}{}
+	}
+	if len(groupsByPayload) < 2 || len(seenEndorsers) < 2 {
+		return nil, nil, proposalResponseMismatchError(responses)
+	}
+
+	groups := make([]*responseGroup, 0, len(groupsByPayload))
+	for _, group := range groupsByPayload {
+		groups = append(groups, group)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		if len(groups[i].responses) != len(groups[j].responses) {
+			return len(groups[i].responses) > len(groups[j].responses)
+		}
+		return bytes.Compare(groups[i].payload, groups[j].payload) < 0
+	})
+	required := (2*len(seenEndorsers) + 2) / 3
+	if len(groups[0].responses) < required ||
+		(len(groups) > 1 && len(groups[0].responses) == len(groups[1].responses)) {
+		return nil, nil, proposalResponseMismatchError(responses)
+	}
+
+	orderedGroups := make([]GrandProposalGroup, 0, len(groups))
+	for _, group := range groups {
+		orderedGroup := GrandProposalGroup{
+			ProposalResponsePayload: append([]byte(nil), group.payload...),
+			Endorsements:            make([]GrandProposalEndorsement, 0, len(group.responses)),
+		}
+		for _, response := range group.responses {
+			orderedGroup.Endorsements = append(orderedGroup.Endorsements, GrandProposalEndorsement{
+				Endorser:  append([]byte(nil), response.Endorsement.Endorser...),
+				Signature: append([]byte(nil), response.Endorsement.Signature...),
+			})
+		}
+		sort.Slice(orderedGroup.Endorsements, func(i, j int) bool {
+			return bytes.Compare(orderedGroup.Endorsements[i].Endorser, orderedGroup.Endorsements[j].Endorser) < 0
+		})
+		orderedGroups = append(orderedGroups, orderedGroup)
+	}
+	return groups[0].responses, orderedGroups, nil
+}
+
+func proposalResponseMismatchError(responses []*peer.ProposalResponse) error {
+	var first, different []byte
+	if len(responses) > 0 && responses[0] != nil {
+		first = responses[0].Payload
+	}
+	for _, response := range responses[1:] {
+		if response != nil && !bytes.Equal(first, response.Payload) {
+			different = response.Payload
+			break
+		}
+	}
+	return errors.Errorf("ProposalResponsePayloads do not match (base64): '%s' vs '%s'",
+		b64.StdEncoding.EncodeToString(different), b64.StdEncoding.EncodeToString(first))
 }
 
 func grandEvidenceIncludesActiveSync(evidence [][]byte) bool {
@@ -817,9 +936,9 @@ func grandRelaxedEvidenceBytesFromEnvelope(txEnvelopeBytes []byte) ([]byte, erro
 	return proposalPayload.TransientMap[GrandRelaxedEvidenceTransientKey], nil
 }
 
-// GetGrandCanonicalEndorsersFromEnvelope returns the canonical endorsement
-// identities so validators can bind each local observation to a peer that also
-// endorsed the byte-identical strong/normal transaction projection.
+// GetGrandCanonicalEndorsersFromEnvelope returns the standard action's
+// canonical endorsement identities. Validators compare these against the
+// canonical proposal group; alternate groups remain in the GraND bundle.
 func GetGrandCanonicalEndorsersFromEnvelope(txEnvelopeBytes []byte) ([][]byte, error) {
 	envelope, err := GetEnvelopeFromBlock(txEnvelopeBytes)
 	if err != nil {
